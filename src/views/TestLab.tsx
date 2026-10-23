@@ -1,7 +1,8 @@
 import { useMemo, useState } from "react";
-import { Copy, Play, Scale, ShieldAlert, ShieldCheck } from "lucide-react";
+import * as Dialog from "@radix-ui/react-dialog";
+import { Copy, Play, Scale, ShieldAlert, ShieldCheck, Sparkles, X } from "lucide-react";
 import { clsx } from "clsx";
-import type { Environment, ExecutionResult, RunRecord, TestCase } from "@shared/types";
+import type { AiTestPlan, Environment, ExecutionResult, RunRecord, TestCase } from "@shared/types";
 import { api } from "../lib/api";
 import { fmtMs } from "../lib/format";
 import type { AppContext } from "../App";
@@ -33,6 +34,11 @@ export default function TestLab({ ctx }: { ctx: AppContext }) {
   const [error, setError] = useState<string | null>(null);
   const [drawer, setDrawer] = useState<{ result: ExecutionResult; env: Environment } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [planOpen, setPlanOpen] = useState(false);
+  const [planScope, setPlanScope] = useState("canary disclosure and prompt injection");
+  const [plan, setPlan] = useState<AiTestPlan | null>(null);
+  const [planning, setPlanning] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
 
   const testById = useMemo(
     () => new Map(ctx.catalog.testCases.map((t) => [t.id, t])),
@@ -87,6 +93,23 @@ export default function TestLab({ ctx }: { ctx: AppContext }) {
     setTimeout(() => setCopied(false), 1500);
   }
 
+  async function generatePlan() {
+    setPlanning(true);
+    setPlanError(null);
+    try {
+      setPlan(await api.generatePlan(planScope));
+    } catch (e) {
+      setPlanError(e instanceof Error ? e.message : "AI planning failed");
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  async function runPlanned(ids: string[]) {
+    setPlanOpen(false);
+    await doRun(() => api.runCustom(environment, ids), "suite");
+  }
+
   const comparing = running?.startsWith("compare") ?? false;
 
   return (
@@ -114,6 +137,18 @@ export default function TestLab({ ctx }: { ctx: AppContext }) {
             disabled={running !== null}
           >
             {running === "suite" ? <Spinner /> : <><Play size={11} /> Run suite</>}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => setPlanOpen(true)}
+            disabled={ctx.status?.gemini.state !== "configured"}
+            title={
+              ctx.status?.gemini.state !== "configured"
+                ? "AI planning requires a configured Gemini key"
+                : "Let AI pick fixture tests for a scope"
+            }
+          >
+            <Sparkles size={11} /> AI plan
           </Button>
         </div>
       </header>
@@ -381,6 +416,86 @@ export default function TestLab({ ctx }: { ctx: AppContext }) {
         open={drawer !== null}
         onClose={() => setDrawer(null)}
       />
+
+      {/* AI-assisted test planning — bounded, allowlisted, advisory only */}
+      <Dialog.Root open={planOpen} onOpenChange={setPlanOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-40 bg-black/60" />
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 w-full max-w-lg -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-panel p-4 shadow-lg">
+            <div className="flex items-center justify-between">
+              <Dialog.Title className="text-sm font-semibold">AI test plan</Dialog.Title>
+              <Dialog.Close
+                aria-label="Close AI test plan"
+                className="rounded p-1 text-muted hover:text-foreground"
+              >
+                <X size={16} />
+              </Dialog.Close>
+            </div>
+            <p className="mt-1 text-2xs leading-relaxed text-muted">
+              The model nominates existing fixture tests for your declared scope. Suggestions
+              outside the catalog are discarded; nothing runs automatically.{" "}
+              <Tag>AI-assisted</Tag>
+            </p>
+            <label
+              htmlFor="plan-scope"
+              className="mt-3 block text-2xs font-medium uppercase tracking-wider text-muted"
+            >
+              Evaluation scope
+            </label>
+            <textarea
+              id="plan-scope"
+              value={planScope}
+              onChange={(e) => setPlanScope(e.target.value)}
+              rows={2}
+              className="mt-1 w-full rounded-md border border-border bg-card px-2.5 py-1.5 font-mono text-xs text-foreground focus:border-accent/50 focus:outline-none"
+            />
+            {planError && (
+              <p className="mt-2 rounded-md border border-danger/40 bg-danger/5 px-2.5 py-1.5 text-2xs text-danger">
+                {planError}
+              </p>
+            )}
+            {plan && (
+              <div className="mt-3 space-y-2 text-xs">
+                <div className="flex items-center gap-2">
+                  <Tag>AI-generated</Tag>
+                  <span className="font-mono text-2xs text-muted">{plan.model}</span>
+                </div>
+                <p className="leading-relaxed text-foreground">{plan.rationale}</p>
+                <ul className="space-y-1">
+                  {plan.recommendedTestIds.map((tid) => (
+                    <li key={tid} className="flex items-center gap-2 font-mono text-2xs">
+                      <span className="text-accent">{tid}</span>
+                      <span className="text-muted">{testById.get(tid)?.title}</span>
+                    </li>
+                  ))}
+                </ul>
+                {plan.ignoredTestIds.length > 0 && (
+                  <p className="text-2xs text-warning">
+                    {plan.ignoredTestIds.length} non-catalog suggestion(s) discarded.
+                  </p>
+                )}
+                {plan.warnings.map((w, i) => (
+                  <p key={i} className="text-2xs text-muted">· {w}</p>
+                ))}
+                <div className="flex items-center gap-2 border-t border-border pt-2">
+                  <Button
+                    onClick={() => runPlanned(plan.recommendedTestIds)}
+                    disabled={running !== null || plan.recommendedTestIds.length === 0}
+                  >
+                    <Play size={11} /> Run recommended ({environment})
+                  </Button>
+                  <span className="text-2xs text-muted">runs via deterministic harness</span>
+                </div>
+              </div>
+            )}
+            <div className="mt-3 flex justify-end">
+              <Button onClick={generatePlan} disabled={planning || !planScope.trim()}>
+                {planning ? <Spinner /> : plan ? "Regenerate" : "Generate plan"}
+              </Button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }

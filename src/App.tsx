@@ -1,11 +1,16 @@
 import { lazy, Suspense, useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import {
+  Bot,
   ClipboardList,
   FlaskConical,
   Gauge,
+  Scale,
   ScrollText,
   ShieldCheck,
+  ShieldHalf,
+  Trophy,
+  Waypoints,
 } from "lucide-react";
 import { api, type Catalog } from "./lib/api";
 import type { Environment, IntegrationStatus } from "@shared/types";
@@ -18,11 +23,21 @@ const TestLab = lazy(() => import("./views/TestLab"));
 const Findings = lazy(() => import("./views/Findings"));
 const Evaluation = lazy(() => import("./views/Evaluation"));
 const Audit = lazy(() => import("./views/Audit"));
+const AgentLab = lazy(() => import("./views/AgentLab"));
+const AttackGraphView = lazy(() => import("./views/AttackGraph"));
+const DefenseLab = lazy(() => import("./views/DefenseLab"));
+const Benchmark = lazy(() => import("./views/Benchmark"));
+const Firewall = lazy(() => import("./views/Firewall"));
 
 const NAV = [
   { to: "/", label: "Overview", icon: Gauge, end: true },
   { to: "/lab", label: "Test Lab", icon: FlaskConical },
+  { to: "/agent", label: "Red Team", icon: Bot },
+  { to: "/attack-graph", label: "Attack Graph", icon: Waypoints },
+  { to: "/defense-lab", label: "Defense Lab", icon: Scale },
   { to: "/findings", label: "Findings", icon: ShieldCheck },
+  { to: "/benchmarks", label: "Benchmarks", icon: Trophy },
+  { to: "/firewall", label: "Firewall", icon: ShieldHalf },
   { to: "/evaluation", label: "Evaluation", icon: ClipboardList },
   { to: "/audit", label: "Audit", icon: ScrollText },
 ];
@@ -39,7 +54,12 @@ export interface AppContext {
 const PAGE_TITLES: Record<string, string> = {
   "/": "Overview",
   "/lab": "Test Lab",
+  "/agent": "Red Team Agent",
+  "/attack-graph": "Attack Graph",
+  "/defense-lab": "Defense Lab",
   "/findings": "Findings",
+  "/benchmarks": "Benchmarks",
+  "/firewall": "Firewall",
   "/evaluation": "Evaluation",
   "/audit": "Audit",
 };
@@ -186,7 +206,12 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<Overview ctx={ctx} />} />
                 <Route path="/lab" element={<TestLab ctx={ctx} />} />
+                <Route path="/agent" element={<AgentLab ctx={ctx} />} />
+                <Route path="/attack-graph" element={<AttackGraphView ctx={ctx} />} />
+                <Route path="/defense-lab" element={<DefenseLab ctx={ctx} />} />
                 <Route path="/findings" element={<Findings ctx={ctx} />} />
+                <Route path="/benchmarks" element={<Benchmark ctx={ctx} />} />
+                <Route path="/firewall" element={<Firewall ctx={ctx} />} />
                 <Route path="/evaluation" element={<Evaluation ctx={ctx} />} />
                 <Route path="/audit" element={<Audit ctx={ctx} />} />
               </Routes>

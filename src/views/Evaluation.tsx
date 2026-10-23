@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { ClipboardCopy, FileJson } from "lucide-react";
-import type { RunRecord } from "@shared/types";
+import { ClipboardCopy, FileJson, Sparkles } from "lucide-react";
+import type { AiRunAnalysis, RunRecord } from "@shared/types";
 import { api, type RunSummary } from "../lib/api";
 import { fmtTime, pct, pctExact } from "../lib/format";
 import type { AppContext } from "../App";
@@ -32,6 +32,9 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
   const [selectedId, setSelectedId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [analysis, setAnalysis] = useState<AiRunAnalysis | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
 
   useEffect(() => {
     api
@@ -45,6 +48,8 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
 
   useEffect(() => {
     if (!selectedId) return;
+    setAnalysis(null);
+    setAnalysisError(null);
     api.getRun(selectedId).then(setRun).catch((e) => setError(e.message));
   }, [selectedId]);
 
@@ -80,6 +85,19 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
     await navigator.clipboard.writeText(summary);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  }
+
+  async function analyze() {
+    if (!run) return;
+    setAnalyzing(true);
+    setAnalysisError(null);
+    try {
+      setAnalysis(await api.analyzeRun(run.id));
+    } catch (e) {
+      setAnalysisError(e instanceof Error ? e.message : "AI analysis failed");
+    } finally {
+      setAnalyzing(false);
+    }
   }
 
   if (error) return <ErrorBanner message={error} />;
@@ -226,6 +244,97 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
               </p>
             </Card>
           </div>
+
+          <Card>
+            <SectionTitle
+              title="AI-assisted analysis"
+              subtitle="Advisory model output — deterministic metrics above remain authoritative"
+              right={
+                <Button
+                  variant="ghost"
+                  onClick={analyze}
+                  disabled={analyzing || !run || ctx.status?.gemini.state !== "configured"}
+                >
+                  <Sparkles size={11} /> {analyzing ? "Analyzing…" : "Run AI analysis"}
+                </Button>
+              }
+            />
+            <div className="p-4 text-xs">
+              {ctx.status?.gemini.state !== "configured" ? (
+                <p className="text-muted">
+                  AI analysis unavailable — Gemini is not configured. The deterministic
+                  evaluation above is complete without it.
+                </p>
+              ) : analysisError ? (
+                <ErrorBanner message={analysisError} />
+              ) : !analysis ? (
+                <p className="text-muted">
+                  Reviews this run's intent, verdict consistency and mitigations using
+                  sanitized evidence. Output is schema-validated and labeled AI-generated.
+                </p>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Tag>AI-generated</Tag>
+                    <span
+                      className={
+                        "rounded px-1.5 py-0.5 text-2xs font-medium " +
+                        (analysis.assessment === "agree"
+                          ? "bg-success/10 text-success"
+                          : analysis.assessment === "disagree"
+                            ? "bg-danger/10 text-danger"
+                            : "bg-warning/10 text-warning")
+                      }
+                    >
+                      verdict consistency: {analysis.assessment}
+                    </span>
+                    <span className="font-mono text-2xs text-muted">
+                      {analysis.model} · {fmtTime(analysis.generatedAt)}
+                    </span>
+                  </div>
+                  <p className="text-2xs italic leading-relaxed text-muted">{analysis.methodology}</p>
+                  <div>
+                    <div className="mb-1 text-2xs font-medium uppercase tracking-wider text-muted">Attack intent</div>
+                    <p className="leading-relaxed text-foreground">{analysis.attackIntent}</p>
+                  </div>
+                  <div>
+                    <div className="mb-1 text-2xs font-medium uppercase tracking-wider text-muted">Evidence summary</div>
+                    <p className="leading-relaxed text-foreground">{analysis.evidenceSummary}</p>
+                  </div>
+                  <div>
+                    <div className="mb-1 text-2xs font-medium uppercase tracking-wider text-muted">Reasoning</div>
+                    <p className="leading-relaxed text-foreground">{analysis.reasoning}</p>
+                  </div>
+                  {analysis.suggestedTests.length > 0 && (
+                    <div>
+                      <div className="mb-1 text-2xs font-medium uppercase tracking-wider text-muted">
+                        Suggested adversarial inputs (model-generated, not scored)
+                      </div>
+                      <ul className="space-y-1.5">
+                        {analysis.suggestedTests.map((t, i) => (
+                          <li key={i} className="rounded border border-border bg-card p-2">
+                            <div className="font-medium">{t.title}</div>
+                            <div className="mt-0.5 font-mono text-2xs text-muted">{t.input}</div>
+                            <div className="mt-0.5 text-2xs text-muted">{t.rationale}</div>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {analysis.mitigations.length > 0 && (
+                    <div>
+                      <div className="mb-1 text-2xs font-medium uppercase tracking-wider text-muted">Mitigations</div>
+                      <ul className="list-disc space-y-0.5 pl-4 leading-relaxed">
+                        {analysis.mitigations.map((m2, i) => (
+                          <li key={i}>{m2}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </Card>
 
           <Card className="overflow-hidden">
             <SectionTitle title="Per-test outcomes" subtitle={`${m.total} executions in this run`} />

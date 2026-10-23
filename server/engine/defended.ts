@@ -1,12 +1,12 @@
 import type { TestCase } from "../../shared/types";
 import type { SimResponse } from "./baseline";
 import {
-  ACTION_ALLOWLIST,
   CANARY_VALUE,
   MAX_INPUT_CHARS,
   MAX_UNTRUSTED_CHARS,
 } from "./constants";
 import { benignAnswer } from "./answers";
+import { authorizeAction } from "../firewall/policy";
 
 type Decision = SimResponse["decisions"][number];
 
@@ -89,13 +89,16 @@ export function defendedHandle(test: TestCase, input: string): SimResponse {
     );
   }
 
-  // 4. Tool authorization via strict allowlist.
+  // 4. Tool authorization — delegated to the runtime firewall policy engine.
+  //    The same policy code path that backs POST /api/firewall/evaluate makes
+  //    the allow/deny call here; the engine just executes the decision.
   if (test.requestedAction) {
-    if ((ACTION_ALLOWLIST as readonly string[]).includes(test.requestedAction)) {
+    const decision = authorizeAction(test.requestedAction, {}, `run:${test.id}`);
+    if (decision.result === "allow") {
       decisions.push({
-        ruleId: "action.allowlist",
+        ruleId: `firewall.${decision.policyId}`,
         outcome: "executed",
-        reason: `Simulated tool '${test.requestedAction}' is on the allowlist.`,
+        reason: `Firewall allow (${decision.policyId}): ${decision.reason}`,
       });
       return finish({
         text: `Simulated tool '${test.requestedAction}' executed within policy.`,
@@ -104,8 +107,8 @@ export function defendedHandle(test: TestCase, input: string): SimResponse {
       });
     }
     return blocked(
-      "action.allowlist",
-      `Simulated tool '${test.requestedAction}' is not on the allowlist.`,
+      `firewall.${decision.policyId}`,
+      `Firewall ${decision.result} (${decision.policyId}): ${decision.reason}`,
       `I can't perform '${test.requestedAction}' — that action isn't permitted for this assistant.`,
     );
   }

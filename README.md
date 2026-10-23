@@ -9,9 +9,35 @@ fixtures against two isolated, simulated assistants:
   authorization, trusted instructions and untrusted input concatenated.
 - **Defended** — the same simulator behind deterministic guardrails: input contracts,
   trust separation, injection screening, canary output protection and a strict
-  simulated-tool allowlist.
+  simulated-tool allowlist enforced by the runtime firewall policy engine.
 
 Everything is synthetic. There are no real credentials, tools, systems or data.
+
+## Capability areas
+
+- **Red Team Agent** — bounded autonomous attack loop (plan → select → execute →
+  observe → evaluate → update) that adapts strategy from observed results, runs only
+  approved catalog tests, and stops on enforced budgets (steps / time / consecutive
+  blocks). Presets: Quick (4 steps/15s), Standard (8/45s), Deep (12/90s). Optional
+  Gemini strategy nomination — validated against the allowlist; the deterministic
+  planner is always authoritative.
+- **Attack Graph** — nodes/edges built strictly from recorded execution events;
+  chain detection requires verified compromise signals (canary disclosure or action
+  execution). Inferred edges are labeled as inference.
+- **Defense Lab** — compare any two runs; regressions = pass in A → fail in B.
+  Missing results are reported, never scored as blocked.
+- **Forensics** — structured per-finding records (trace ID, timeline, decisions,
+  root cause, remediation + regression test) plus a sanitized print-friendly HTML
+  report export per run.
+- **Benchmark Arena** — reproducible runs with config fingerprints
+  (suite+tests+env+versions) and a transparent weighted score. Deterministic
+  comparisons only — no external rankings.
+- **Runtime Firewall** — server-side policy engine (tool allowlist, argument
+  validation, protected-data markers, single-use approval tokens, session guard,
+  fail-closed). `POST /api/firewall/evaluate` is test mode; the defended simulator
+  uses the same `evaluate()` path.
+- **Audit integrity** — audit events form a SHA-256 hash chain, verified via
+  `GET /api/audit/verify`. Detects modification; does not prove events true.
 
 ## Quick start
 
@@ -43,7 +69,12 @@ npm run typecheck
 |------|--------------|
 | **Overview** | Posture stats computed from actual runs: attack success rate, block rate, false-refusal rate, latency, environment comparison, failures-by-category chart, recent runs, top findings. |
 | **Test Lab** | Pick an environment, run single cases or full/partial suites. Each result opens an evidence drawer: prompt, untrusted content, defense decisions, canary check, action check, sanitized response. |
+| **Red Team** | Bounded autonomous agent with live trace, budget meter, stop control and session history. |
+| **Attack Graph** | Interactive observed-event graph per run: stage columns, verified attack chains, node detail with evidence refs. |
+| **Defense Lab** | Run-vs-run comparison: metric deltas, per-test verdicts, regression flags, latency deltas. |
 | **Findings** | Every failed execution becomes a finding (severity, evidence, reproduction steps, remediation). Triage status, rerun, or request an AI investigation summary. |
+| **Benchmarks** | Reproducible benchmark runs with fingerprints, transparent weighted scores and side-by-side comparisons. |
+| **Firewall** | Policy rules, an interactive tool-call evaluator, single-use approval flow and a decision log. |
 | **Evaluation** | Per-run confusion matrix, precision/recall/F1, attack success rate, benign false-refusal rate — with denominators, definitions, exclusion rules, JSON report export and a copyable executive summary. |
 | **Audit** | Timestamped trail of runs, executions, findings, exports, investigations and resets. One-click reset (double-confirm). |
 
@@ -107,6 +138,12 @@ tests/               vitest unit tests
   `PS_ADMIN_TOKEN` set, callers must present it via `x-admin-token`; otherwise
   the endpoint is loopback-only (403 for non-local callers). The confirmation
   string alone is not authentication.
+- Optional deployment auth: set `PS_API_TOKEN` and every mutating/quota
+  endpoint (`POST /api/runs`, `/api/investigate`, `/api/plans`,
+  `/api/runs/:id/analysis`, `PATCH /api/findings/:id`, rerun, reset) requires
+  `x-api-token`. Constant-time comparison, 401 on failure, never logged or
+  returned. Unset = documented local demo mode (the bundled SPA has no token
+  mechanism — deployed mode expects an external caller or gateway).
 - `trust proxy` is disabled: rate limits and loopback checks key off the real
   socket peer and cannot be spoofed via `X-Forwarded-For`. Behind a reverse
   proxy, set a specific trusted hop count — never `true`.
@@ -116,7 +153,12 @@ tests/               vitest unit tests
 - Corrupt storage is quarantined and logged (without contents) instead of
   silently discarded.
 - Gemini calls carry an `AbortSignal` timeout that cancels the underlying
-  request rather than just abandoning it.
+  client request rather than just abandoning it (SDK limitation: this does not
+  guarantee cancellation of server-side model processing).
+- AI-assisted endpoints are advisory only: `POST /api/runs/:id/analysis`
+  returns schema-validated analysis of a run; `POST /api/plans` returns a
+  bounded test plan restricted to existing fixture IDs (non-catalog
+  suggestions are dropped). Neither affects metrics or verdicts.
 
 ## Threat model & limitations
 
@@ -132,14 +174,16 @@ tests/               vitest unit tests
 
 ## Test results
 
-`npm test` → **61/61 passing**: 16 engine harness tests + 19 metrics tests
-(unknown IDs, duplicates, empty/degenerate denominators) + 20 API integration
-tests (validation, oversized payloads, redaction, rerun, report, rate limiting
-+ recovery, reset confirmation + admin-token authorization, header checks,
-X-Forwarded-For spoof rejection) + 6 Gemini tests (mocked SDK: success,
-abort-signal propagation, hang timeout, provider errors, fallback). API tests
-run against an isolated temp data file — developer data and the real Gemini
-API are never touched.
+`npm test` → **97/97 passing**: 16 engine harness + 19 metrics (unknown IDs,
+duplicates, missing results, zero denominators) + 29 API integration
+(validation, 413 oversized, redaction, rerun, report, rate limiting +
+recovery, reset + API-token authorization, XFF spoof rejection, headers,
+firewall/benchmark/defense-lab/forensics/graph endpoints, agent lifecycle) +
+6 mocked-Gemini + 8 mocked AI-evaluation + 15 platform unit tests (firewall
+rules incl. approval replay, agent lifecycle/adaptation/cancellation, graph
+chains, forensics, benchmark scoring) + 4 axe-core accessibility tests
+(jsdom). API tests run against an isolated temp data file — developer data
+and the real Gemini API are never touched.
 
 ## Known dependency residuals (audit, 2026-10-23)
 

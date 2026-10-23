@@ -136,7 +136,206 @@ export type AuditEventType =
   | "data_reset"
   | "investigation_requested"
   | "investigation_completed"
-  | "investigation_failed";
+  | "investigation_failed"
+  | "ai_analysis"
+  | "ai_plan"
+  | "agent_session"
+  | "firewall_decision"
+  | "benchmark_run";
+
+export interface SuggestedTest {
+  title: string;
+  input: string;
+  rationale: string;
+}
+
+/**
+ * AI-generated review of a deterministic run. Advisory only — never feeds
+ * metrics or verdicts.
+ */
+export interface AiRunAnalysis {
+  runId: string;
+  environment: Environment;
+  model: string;
+  generatedAt: string;
+  isAiGenerated: true;
+  methodology: string;
+  attackIntent: string;
+  assessment: "agree" | "disagree" | "uncertain";
+  reasoning: string;
+  evidenceSummary: string;
+  suggestedTests: SuggestedTest[];
+  mitigations: string[];
+}
+
+/** Bounded AI test plan: model nominates existing fixture IDs only. */
+export interface AiTestPlan {
+  scope: string;
+  model: string;
+  generatedAt: string;
+  isAiGenerated: true;
+  methodology: string;
+  rationale: string;
+  recommendedTestIds: string[];
+  /** Model-suggested IDs that failed the catalog allowlist — dropped. */
+  ignoredTestIds: string[];
+  warnings: string[];
+}
+
+// --- Red-team agent --------------------------------------------------------
+
+export type AgentPreset = "quick" | "standard" | "deep";
+export type AgentPhase =
+  | "plan" | "select" | "execute" | "observe" | "evaluate" | "update" | "done";
+export type AgentStatus = "running" | "completed" | "stopped" | "error";
+
+export interface AgentStep {
+  step: number;
+  at: string;
+  phase: AgentPhase;
+  strategyId?: string;
+  testId?: string;
+  outcome?: "success" | "blocked" | "other";
+  durationMs?: number;
+  detail: string;
+}
+
+export interface AgentSession {
+  id: string;
+  environment: Environment;
+  preset: AgentPreset;
+  status: AgentStatus;
+  phase: AgentPhase;
+  currentStrategy: string | null;
+  attemptedTestIds: string[];
+  successfulTestIds: string[];
+  blockedCount: number;
+  consecutiveBlocks: number;
+  findings: string[];
+  trace: AgentStep[];
+  budget: { maxSteps: number; maxMs: number; stepsUsed: number; startedAt: string };
+  planningSource: "deterministic" | "gemini";
+  stopReason: string | null;
+  createdAt: string;
+  seed: string;
+  /** Set when the session's aggregate run has been persisted. */
+  runId?: string;
+}
+
+// --- Attack graph ----------------------------------------------------------
+
+export type GraphNodeType =
+  | "entry"
+  | "untrusted_input"
+  | "technique"
+  | "action_attempt"
+  | "data_access"
+  | "policy_decision"
+  | "outcome";
+
+export interface GraphNode {
+  id: string;
+  type: GraphNodeType;
+  label: string;
+  testId?: string;
+  ref?: string;
+  outcome?: string;
+  evidence?: string[];
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  label: string;
+  /** true = relationship inferred from sequence, not directly recorded */
+  inferred?: boolean;
+}
+
+export interface AttackChain {
+  id: string;
+  label: string;
+  severity: Finding["severity"];
+  steps: string[]; // node ids in order
+  summary: string;
+  evidenceRefs: string[];
+}
+
+export interface AttackGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  chains: AttackChain[];
+}
+
+// --- Forensics -------------------------------------------------------------
+
+export interface ForensicRecord {
+  findingId: string;
+  runId: string;
+  sessionId?: string;
+  traceId: string;
+  testId: string;
+  severity: Finding["severity"];
+  confidence: "high" | "medium" | "low";
+  category: Finding["category"];
+  input: string;
+  defense: { environment: Environment; description: string };
+  outcome: {
+    verdict: Verdict;
+    canaryLeaked: boolean;
+    privateDataLeaked: boolean;
+    actionExecuted: boolean;
+    blocked: boolean;
+  };
+  toolAttempts: string[];
+  policyDecisions: { ruleId: string; outcome: string; reason: string }[];
+  timeline: { at: string; event: string; detail: string }[];
+  rootCause: string;
+  impact: string;
+  remediation: {
+    control: string;
+    suggestedChange: string;
+    regressionTest: string;
+    verifySteps: string[];
+    source: "deterministic" | "ai";
+  };
+  evidence: EvidenceItem[];
+  reproduction: string[];
+  replayEligible: boolean;
+  verificationStatus: string;
+  integrity: { note: string; hashPrefix?: string };
+}
+
+// --- Benchmarks ------------------------------------------------------------
+
+export interface BenchmarkWeights {
+  attackSuccess: number;
+  falseRefusal: number;
+  blockRate: number;
+  f1: number;
+}
+
+export interface BenchmarkRun {
+  id: string;
+  runId: string;
+  suiteId: string;
+  environment: Environment;
+  fingerprint: string;
+  fixtureVersion: string;
+  evaluatorVersion: string;
+  runtime: string;
+  weights: BenchmarkWeights;
+  score: number | null;
+  metrics: {
+    attackSuccessRate: number | null;
+    benignFalseRefusalRate: number | null;
+    defenseBlockRate: number | null;
+    f1: number | null;
+    total: number;
+    errors: number;
+  };
+  at: string;
+  reproducible: "exact" | "approximate";
+}
 
 export interface AuditEvent {
   id: string;
@@ -147,6 +346,8 @@ export interface AuditEvent {
   findingId?: string;
   environment?: Environment;
   detail: string;
+  /** Tamper-evidence hash chaining this event to the previous one. */
+  hash?: string;
 }
 
 export interface OverviewStats {

@@ -1,13 +1,3 @@
-/**
- * API integration tests — drive the real Express app via supertest.
- *
- * Isolation guarantees:
- *  - PROMPTSHIELD_DB_PATH points at a fresh temp file per test-file run, so
- *    developer/production data is never loaded or mutated.
- *  - DOTENV_CONFIG_PATH points at a nonexistent file and GEMINI_API_KEY is
- *    cleared, so tests can never call the real Gemini API even if the dev
- *    has a key in .env.
- */
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
 import { mkdtempSync } from "node:fs";
@@ -29,9 +19,11 @@ beforeAll(async () => {
   // a low investigate max makes the 429 boundary deterministic.
   process.env.PS_RL_WINDOW_MS = "400";
   process.env.PS_RL_INVESTIGATE_MAX = "3";
+  process.env.PS_RL_RUNS_MAX = "20";
   // Keep reset's own limiter out of the way — the suite makes ~7 reset calls.
   process.env.PS_RL_RESET_MAX = "50";
   delete process.env.PS_ADMIN_TOKEN;
+  delete process.env.PS_API_TOKEN;
   const mod = await import("../server/index");
   app = mod.app;
 });
@@ -219,7 +211,61 @@ describe("POST /api/reset", () => {
   });
 });
 
+describe("API token authentication (PS_API_TOKEN)", () => {
+  it("rejects mutations without/with wrong token when configured", async () => {
+    process.env.PS_API_TOKEN = "deploy-token-123";
+    try {
+      const noToken = await request(app)
+        .post("/api/runs")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(noToken.status).toBe(401);
+
+      const wrongToken = await request(app)
+        .post("/api/runs")
+        .set("x-api-token", "near-miss-token")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(wrongToken.status).toBe(401);
+
+      const investigate = await request(app).post("/api/investigate").send({ findingId: "x" });
+      expect(investigate.status).toBe(401);
+
+      const patch = await request(app).patch("/api/findings/whatever").send({ status: "open" });
+      expect(patch.status).toBe(401);
+
+      // Reset still needs BOTH the api token AND its own confirmation.
+      const resetNoConfirm = await request(app)
+        .post("/api/reset")
+        .set("x-api-token", "deploy-token-123")
+        .send({});
+      expect(resetNoConfirm.status).toBe(400);
+
+      const ok = await request(app)
+        .post("/api/runs")
+        .set("x-api-token", "deploy-token-123")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(ok.status).toBe(200);
+    } finally {
+      delete process.env.PS_API_TOKEN;
+    }
+  });
+});
+
 describe("rate limiting", () => {
+  it("rate-limits finding reruns (429 under burst)", async () => {
+    await request(app).post("/api/runs").send({ environment: "baseline", suiteId: "full" });
+    const findings = await request(app).get("/api/findings");
+    const id = findings.body[0].id;
+    // Concurrent burst lands in one window: with max 20/window, the tail 429s.
+    const results = await Promise.all(
+      Array.from({ length: 25 }, () =>
+        request(app).post(`/api/findings/${id}/rerun`).send({}),
+      ),
+    );
+    const statuses = results.map((r) => r.status);
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(3);
+    expect(statuses.filter((s) => s === 200).length).toBeGreaterThanOrEqual(1);
+  });
+
   it("returns 429 after the investigate limit is exceeded, then recovers", async () => {
     // Limit configured for tests: 3 requests / 400ms window.
     await request(app).post("/api/runs").send({ environment: "baseline", testId: "PS-INJ-01" });
@@ -245,5 +291,135 @@ describe("rate limiting", () => {
     await new Promise((r) => setTimeout(r, 500));
     const recovered = await request(app).post("/api/investigate").send({ findingId: id });
     expect(recovered.status).not.toBe(429);
+  });
+});
+
+describe("platform endpoints", () => {
+  it("firewall evaluate: deny unknown tool, allow allowlisted", async () => {
+    const deny = await request(app)
+      .post("/api/firewall/evaluate")
+      .send({ tool: "delete_all_users", args: {} });
+    expect(deny.status).toBe(200);
+    expect(deny.body.result).toBe("deny");
+    expect(deny.body.policyId).toBe("R1");
+
+    const allow = await request(app)
+      .post("/api/firewall/evaluate")
+      .send({ tool: "lookup_ticket", args: { ticketId: "T-9" } });
+    expect(allow.status).toBe(200);
+    expect(allow.body.result).toBe("allow");
+  });
+
+  it("firewall approval flow via API", async () => {
+    const noToken = await request(app)
+      .post("/api/firewall/evaluate")
+      .send({ tool: "export_report", args: { format: "json" } });
+    expect(noToken.body.result).toBe("approval_required");
+
+    const approval = await request(app)
+      .post("/api/firewall/approvals")
+      .send({ tool: "export_report", args: { format: "json" } });
+    expect(approval.status).toBe(201);
+    expect(approval.body.token).toBeTruthy();
+
+    const withToken = await request(app)
+      .post("/api/firewall/evaluate")
+      .send({ tool: "export_report", args: { format: "json" }, approvalToken: approval.body.token });
+    expect(withToken.body.result).toBe("allow");
+  });
+
+  it("agent session lifecycle via API", async () => {
+    const bad = await request(app)
+      .post("/api/agent/sessions")
+      .send({ environment: "baseline" });
+    expect(bad.status).toBe(400);
+
+    const created = await request(app)
+      .post("/api/agent/sessions")
+      .send({ environment: "baseline", preset: "quick" });
+    expect(created.status).toBe(202);
+    expect(created.body.id).toMatch(/^agent-/);
+
+    // Poll until the session settles (quick preset, fast test pacing).
+    let s = created.body;
+    for (let i = 0; i < 60 && s.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      s = (await request(app).get(`/api/agent/sessions/${s.id}`)).body;
+    }
+    expect(["completed", "stopped"]).toContain(s.status);
+    expect(s.budget.stepsUsed).toBeGreaterThan(0);
+    expect(s.trace.length).toBeGreaterThan(2);
+  });
+
+  it("benchmark run + compare", async () => {
+    const b1 = await request(app)
+      .post("/api/benchmarks/run")
+      .send({ environment: "baseline", suiteId: "full" });
+    expect(b1.status).toBe(201);
+    expect(b1.body.benchmark.fingerprint).toBeTruthy();
+    expect(b1.body.benchmark.reproducible).toBe("exact");
+
+    const b2 = await request(app)
+      .post("/api/benchmarks/run")
+      .send({ environment: "defended", suiteId: "full" });
+    expect(b2.status).toBe(201);
+
+    const cmp = await request(app).get(
+      `/api/benchmarks/compare?a=${b1.body.benchmark.id}&b=${b2.body.benchmark.id}`,
+    );
+    expect(cmp.status).toBe(200);
+    expect(cmp.body.sameConfiguration).toBe(false);
+    expect(cmp.body.deltas.score).not.toBeNull();
+  });
+
+  it("defense-lab compare reports regressions, not invents them", async () => {
+    const base = await request(app)
+      .post("/api/runs")
+      .send({ environment: "baseline", suiteId: "full" });
+    const def = await request(app)
+      .post("/api/runs")
+      .send({ environment: "defended", suiteId: "full" });
+    const cmp = await request(app).get(
+      `/api/defense-lab/compare?a=${def.body.id}&b=${base.body.id}`,
+    );
+    expect(cmp.status).toBe(200);
+    expect(cmp.body.rows.length).toBeGreaterThan(5);
+    // defended→baseline direction: attacks blocked before, succeeding now = regressions.
+    expect(cmp.body.regressions).toBeGreaterThan(0);
+  });
+
+  it("forensics + audit integrity + HTML report", async () => {
+    const run = await request(app)
+      .post("/api/runs")
+      .send({ environment: "baseline", testId: "PS-INJ-01" });
+    const findings = await request(app).get("/api/findings");
+    const f = findings.body.find((x: { testId: string }) => x.testId === "PS-INJ-01");
+
+    const rec = await request(app).get(`/api/findings/${f.id}/forensics`);
+    expect(rec.status).toBe(200);
+    expect(rec.body.traceId).toContain(run.body.id);
+    expect(rec.body.remediation.regressionTest).toBeTruthy();
+    expect(JSON.stringify(rec.body)).not.toMatch(/PS-CANARY-[A-Z0-9]{10,}/);
+
+    const verify = await request(app).get("/api/audit/verify");
+    expect(verify.status).toBe(200);
+    expect(verify.body.valid).toBe(true);
+    expect(verify.body.checked).toBeGreaterThan(0);
+
+    const html = await request(app).get(`/api/runs/${run.body.id}/report.html`);
+    expect(html.status).toBe(200);
+    expect(html.headers["content-type"]).toContain("text/html");
+    expect(html.text).toContain("PromptShield AI — Security Evaluation Report");
+    expect(html.text).not.toMatch(/PS-CANARY-[A-Z0-9]{10,}/);
+  });
+
+  it("attack graph endpoint returns observed events", async () => {
+    const run = await request(app)
+      .post("/api/runs")
+      .send({ environment: "baseline", testId: "PS-INJ-01" });
+    const g = await request(app).get(`/api/runs/${run.body.id}/graph`);
+    expect(g.status).toBe(200);
+    expect(g.body.nodes.length).toBeGreaterThan(3);
+    expect(g.body.chains.some((c: { steps: string[] }) => c.steps.length >= 3)).toBe(true);
   });
 });

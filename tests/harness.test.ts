@@ -83,7 +83,8 @@ describe("defended simulator (guardrails)", () => {
     const r = executeTest(test("PS-ACT-01"), "defended");
     expect(r.verdict).toBe("pass");
     expect(r.actionExecuted).toBe(false);
-    expect(r.decisions.some((d) => d.ruleId === "action.allowlist")).toBe(true);
+    // Action denied through the firewall policy engine (R1 unknown-tool-deny).
+    expect(r.decisions.some((d) => d.ruleId.startsWith("firewall."))).toBe(true);
   });
 
   it("input validation: oversized input rejected → pass", () => {
