@@ -16,12 +16,20 @@ import { geminiStatus, GeminiUnavailable, investigate } from "./gemini";
 import { requireApiToken, safeTokenEqual } from "./auth";
 import { analyzeRunWithGemini, planTestsWithGemini } from "./ai-eval";
 import {
-  acquireOwnerSlot,
   cancelSession,
-
+  ownerActiveCount,
   runAgent,
+  MAX_CONCURRENT_PER_OWNER,
   PRESETS,
 } from "./agent/session";
+import {
+  abandonIdempotency,
+  IDEM_KEY_RE,
+  idemScope,
+  lookupIdempotency,
+  recordIdempotency,
+  requestFingerprint,
+} from "./idempotency";
 import { buildAttackGraph } from "./graph";
 import { buildForensicRecord } from "./forensics";
 import { toBenchmarkRun } from "./benchmark";
@@ -434,11 +442,40 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
     return res.status(400).json({ error: "Provide environment and preset (quick|standard|deep)" });
   }
   const owner = req.ip ?? "unknown";
-  if (!acquireOwnerSlot(owner)) {
+  const { environment, preset } = parsed.data;
+
+  // --- Idempotency-Key (optional, process-local) ---
+  const idemHeader = req.get("Idempotency-Key");
+  let scopeKey: string | null = null;
+  let fingerprint = "";
+  if (idemHeader !== undefined) {
+    if (!IDEM_KEY_RE.test(idemHeader)) {
+      return res.status(400).json({ error: "Idempotency-Key must be 8-128 chars of [A-Za-z0-9_-]" });
+    }
+    fingerprint = requestFingerprint(parsed.data);
+    scopeKey = idemScope(owner, "agent_sessions", idemHeader);
+    const existing = lookupIdempotency(scopeKey);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        return res.status(409).json({ error: "Idempotency-Key was already used with a different request." });
+      }
+      const existingSession = store.getAgentSession(existing.sessionId);
+      if (existingSession) {
+        // Replay — no new session, no slot, no duplicate audit event.
+        return res.status(200).set("Idempotency-Replayed", "true").json(existingSession);
+      }
+      // Stored session was trimmed from retention — treat as new.
+    }
+  }
+
+  // Read-only precheck only — runAgent is the sole owner of slot
+  // acquire/release; a race past this check surfaces as an honest
+  // 'concurrency_limit' session error, never a leaked slot.
+  if (ownerActiveCount(owner) >= MAX_CONCURRENT_PER_OWNER) {
+    if (scopeKey) abandonIdempotency(scopeKey);
     return res.status(429).json({ error: "Concurrent session limit reached for this client." });
   }
   const sessionId = id("agent");
-  const { environment, preset } = parsed.data;
 
   const session = {
     id: sessionId,
@@ -460,7 +497,13 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
     seed: sessionId,
   };
   // Persist BEFORE launching so the first onStep update has a row to hit.
-  store.addAgentSession(session);
+  try {
+    store.addAgentSession(session);
+  } catch {
+    if (scopeKey) abandonIdempotency(scopeKey);
+    return res.status(500).json({ error: "Failed to create agent session" });
+  }
+  if (scopeKey) recordIdempotency(scopeKey, fingerprint, sessionId);
   store.audit({
     type: "agent_session",
     environment,
@@ -487,6 +530,16 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
       });
     },
   }).then(({ session, results }) => {
+    // Rejected sessions (e.g. raced concurrency limit) have no results —
+    // persist their terminal state only, no synthetic run.
+    if (results.length === 0 && session.status === "error") {
+      store.updateAgentSession(session.id, {
+        status: session.status,
+        stopReason: session.stopReason,
+        trace: session.trace,
+      });
+      return;
+    }
     // Persist the session's executions as a normal run so findings, graph,
     // reports and forensics all work uniformly.
     const testMap = new Map(TEST_CASES.map((t) => [t.id, t]));

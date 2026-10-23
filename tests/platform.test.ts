@@ -2,7 +2,7 @@
  * Platform feature tests — firewall, agent, graph, forensics, benchmark.
  * Isolated temp storage; no external calls.
  */
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -230,5 +230,119 @@ describe("benchmark", () => {
     } as never);
     // Only BFRR available → score = 100*(1-0.5) = 50.
     expect(s.score).toBe(50);
+  });
+});
+
+describe("agent owner-slot lifecycle", () => {
+  it("four sequential sessions for one owner complete; count returns to 0 each time", async () => {
+    for (let i = 0; i < 4; i++) {
+      const { session } = await agent.runAgent({
+        sessionId: `agent-seq-${i}`,
+        environment: "baseline",
+        preset: "quick",
+        owner: "owner-seq",
+      });
+      expect(session.status).toBe("completed");
+      expect(agent.ownerActiveCount("owner-seq")).toBe(0);
+    }
+  });
+
+  it("concurrent cap enforced: 4th concurrent session is rejected, not leaked", async () => {
+    const owner = "owner-conc";
+    const p1 = agent.runAgent({ sessionId: "c1", environment: "defended", preset: "deep", owner });
+    const p2 = agent.runAgent({ sessionId: "c2", environment: "defended", preset: "deep", owner });
+    const p3 = agent.runAgent({ sessionId: "c3", environment: "defended", preset: "deep", owner });
+    await new Promise((r) => setTimeout(r, 30)); // let the three acquire
+    expect(agent.ownerActiveCount(owner)).toBe(3);
+
+    const fourth = await agent.runAgent({ sessionId: "c4", environment: "defended", preset: "quick", owner });
+    expect(fourth.session.status).toBe("error");
+    expect(fourth.session.stopReason).toBe("concurrency_limit");
+    expect(agent.ownerActiveCount(owner)).toBe(3); // rejected, not leaked
+
+    await Promise.all([p1, p2, p3]);
+    expect(agent.ownerActiveCount(owner)).toBe(0); // released exactly once each
+  });
+
+  it("cancellation releases the slot", async () => {
+    const owner = "owner-cancel";
+    const p = agent.runAgent({
+      sessionId: "cancel-1",
+      environment: "defended",
+      preset: "deep",
+      owner,
+      onStep: (s) => { if (s.budget.stepsUsed === 1) agent.cancelSession(s.id); },
+    });
+    await p;
+    expect(agent.ownerActiveCount(owner)).toBe(0);
+  });
+
+  it("an engine exception releases the slot exactly once", async () => {
+    const owner = "owner-err";
+    const harness = await import("../server/engine/harness");
+    const spy = vi.spyOn(harness, "executeTest").mockImplementation(() => {
+      throw new Error("engine boom");
+    });
+    try {
+      const { session } = await agent.runAgent({
+        sessionId: "err-1",
+        environment: "baseline",
+        preset: "quick",
+        owner,
+      });
+      expect(session.status).toBe("error");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(agent.ownerActiveCount(owner)).toBe(0);
+  });
+
+  it("different owners have independent limits", async () => {
+    const p1 = agent.runAgent({ sessionId: "o1", environment: "defended", preset: "deep", owner: "owner-A" });
+    const p2 = agent.runAgent({ sessionId: "o2", environment: "defended", preset: "deep", owner: "owner-A" });
+    const p3 = agent.runAgent({ sessionId: "o3", environment: "defended", preset: "deep", owner: "owner-A" });
+    await new Promise((r) => setTimeout(r, 30));
+    // owner B is unaffected by A's full slots.
+    const { session: bSession } = await agent.runAgent({
+      sessionId: "ob",
+      environment: "defended",
+      preset: "quick",
+      owner: "owner-B",
+    });
+    expect(bSession.status).toBe("completed");
+    await Promise.all([p1, p2, p3]);
+    expect(agent.ownerActiveCount("owner-A")).toBe(0);
+  });
+});
+
+describe("idempotency store (unit)", () => {
+  it("expired keys become reusable; different owners are independent", async () => {
+    const idem = await import("../server/idempotency");
+    vi.useFakeTimers();
+    try {
+      const scopeA = idem.idemScope("owner-A", "route", "key-12345678");
+      const scopeB = idem.idemScope("owner-B", "route", "key-12345678");
+      expect(scopeA).not.toBe(scopeB); // owner-scoped
+      const fp1 = idem.requestFingerprint({ environment: "baseline", preset: "quick" });
+      const fp2 = idem.requestFingerprint({ environment: "defended", preset: "quick" });
+      const fp1b = idem.requestFingerprint({ preset: "quick", environment: "baseline" });
+      expect(fp1).toBe(fp1b); // key-order-insensitive
+      expect(fp1).not.toBe(fp2);
+
+      idem.recordIdempotency(scopeA, fp1, "sess-1");
+      expect(idem.lookupIdempotency(scopeA)?.sessionId).toBe("sess-1");
+      expect(idem.lookupIdempotency(scopeB)).toBeNull();
+
+      // Past the 60s window the key is reusable.
+      vi.advanceTimersByTime(61_000);
+      expect(idem.lookupIdempotency(scopeA)).toBeNull();
+      idem.recordIdempotency(scopeA, fp2, "sess-2");
+      expect(idem.lookupIdempotency(scopeA)?.sessionId).toBe("sess-2");
+
+      idem.abandonIdempotency(scopeA);
+      expect(idem.lookupIdempotency(scopeA)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

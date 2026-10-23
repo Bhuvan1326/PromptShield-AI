@@ -24,6 +24,9 @@ beforeAll(async () => {
   process.env.PS_RL_RESET_MAX = "50";
   delete process.env.PS_ADMIN_TOKEN;
   delete process.env.PS_API_TOKEN;
+  // Fast simulated pacing so agent sessions settle within the test run
+  // (otherwise concurrent slot state leaks between test cases).
+  process.env.PS_AGENT_STEP_DELAY_MS = "10";
   const mod = await import("../server/index");
   app = mod.app;
 });
@@ -421,5 +424,62 @@ describe("platform endpoints", () => {
     expect(g.status).toBe(200);
     expect(g.body.nodes.length).toBeGreaterThan(3);
     expect(g.body.chains.some((c: { steps: string[] }) => c.steps.length >= 3)).toBe(true);
+  });
+});
+
+describe("agent idempotency", () => {
+  const key = "Idem-Key-42";
+  const body = { environment: "baseline", preset: "quick" };
+
+  it("same key + same request replays the session (no second agent/audit)", async () => {
+    const before = (await request(app).get("/api/agent/sessions")).body.length;
+    const r1 = await request(app).post("/api/agent/sessions").set("Idempotency-Key", key).send(body);
+    expect(r1.status).toBe(202);
+    const r2 = await request(app).post("/api/agent/sessions").set("Idempotency-Key", key).send(body);
+    expect(r2.status).toBe(200);
+    expect(r2.headers["idempotency-replayed"]).toBe("true");
+    expect(r2.body.id).toBe(r1.body.id);
+
+    const after = (await request(app).get("/api/agent/sessions")).body.length;
+    expect(after).toBe(before + 1); // exactly one session created
+
+    const audit = (await request(app).get("/api/audit")).body;
+    const started = audit.filter(
+      (e: { detail: string }) => e.detail.includes(r1.body.id) && e.detail.includes("started"),
+    );
+    expect(started.length).toBe(1); // one session-created event only
+  });
+
+  it("same key + different request returns 409", async () => {
+    await request(app).post("/api/agent/sessions").set("Idempotency-Key", "Conflict-Key-9").send(body);
+    const r = await request(app)
+      .post("/api/agent/sessions")
+      .set("Idempotency-Key", "Conflict-Key-9")
+      .send({ environment: "defended", preset: "quick" });
+    expect(r.status).toBe(409);
+  });
+
+  it("invalid keys are rejected", async () => {
+    const r = await request(app).post("/api/agent/sessions").set("Idempotency-Key", "x").send(body);
+    expect(r.status).toBe(400);
+  });
+
+  it("concurrent duplicates create exactly one session", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        request(app).post("/api/agent/sessions").set("Idempotency-Key", "Conc-Key-777").send(body),
+      ),
+    );
+    const ids = new Set(results.map((r) => r.body.id));
+    expect(ids.size).toBe(1);
+    expect(results.some((r) => r.status === 202)).toBe(true);
+  });
+
+  it("requests without a key still work normally", async () => {
+    // Prior describes consume the shared runs-scope window; wait it out so
+    // this asserts behavior, not rate-limit boundary luck.
+    await new Promise((r) => setTimeout(r, 450));
+    const r = await request(app).post("/api/agent/sessions").send(body);
+    expect(r.status).toBe(202);
   });
 });

@@ -58,7 +58,7 @@ const STEP_DELAY_MS = Number(process.env.PS_AGENT_STEP_DELAY_MS) || 400;
 
 const cancelFlags = new Set<string>();
 const activeByOwner = new Map<string, number>();
-const MAX_CONCURRENT_PER_OWNER = 3;
+export const MAX_CONCURRENT_PER_OWNER = 3;
 
 export function cancelSession(id: string) {
   cancelFlags.add(id);
@@ -206,9 +206,19 @@ export async function runAgent(opts: {
     seed: opts.sessionId, // deterministic trace — sessions are reproducible
   };
 
-  registerSession(session.id);
-  acquireOwnerSlot(opts.owner);
   const results: ExecutionResult[] = [];
+
+  // OWNER-SLOT LIFECYCLE: runAgent is the sole owner — acquire here, release
+  // exactly once in finally below. A failed acquire NEVER releases (it owns
+  // nothing) and NEVER registers a firewall session.
+  if (!acquireOwnerSlot(opts.owner)) {
+    session.status = "error";
+    session.phase = "done";
+    session.stopReason = "concurrency_limit";
+    step(session, { phase: "done", detail: "Rejected: owner concurrency limit reached" });
+    return { session, results };
+  }
+  registerSession(session.id);
 
   try {
     transition(session, "plan");
