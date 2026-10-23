@@ -73,6 +73,12 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded-md focus:border focus:border-accent/50 focus:bg-surface focus:px-3 focus:py-2 focus:text-xs focus:text-accent"
+      >
+        Skip to main content
+      </a>
       {/* Left navigation — 220px engineering rail */}
       <aside className="fixed inset-y-0 left-0 z-30 flex w-[220px] flex-col border-r border-border bg-surface">
         <div className="border-b border-border px-4 py-4">
@@ -155,7 +161,7 @@ export default function App() {
           </div>
         </header>
 
-        <main className="flex-1 px-5 py-5">
+        <main id="main-content" tabIndex={-1} className="flex-1 px-5 py-5">
           {error && (
             <div className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-4 py-3 text-xs text-danger">
               Could not reach the PromptShield API ({error}). Is the backend running on port 8787?

@@ -83,5 +83,9 @@ export const api = {
       body: JSON.stringify({ findingId }),
     }),
   audit: () => request<AuditEvent[]>("/api/audit"),
-  reset: () => request<{ ok: true }>("/api/reset", { method: "POST", body: "{}" }),
+  reset: () =>
+    request<{ ok: true }>("/api/reset", {
+      method: "POST",
+      body: JSON.stringify({ confirm: "RESET" }),
+    }),
 };

@@ -21,7 +21,10 @@ export function safeRatio(numerator: number, denominator: number): number | null
   return round3(numerator / denominator);
 }
 
-export function computeMetrics(results: ScoredResult[]): RunMetrics {
+export function computeMetrics(
+  results: ScoredResult[],
+  opts: { unknownTestIds?: number } = {},
+): RunMetrics {
   const confusion: ConfusionMatrix = { tp: 0, fp: 0, tn: 0, fn: 0 };
   let scoredAttack = 0;
   let scoredBenign = 0;
@@ -55,7 +58,7 @@ export function computeMetrics(results: ScoredResult[]): RunMetrics {
     }
   }
 
-  const { tp, fp, tn, fn } = confusion;
+  const { tp, fp, fn } = confusion;
   const precision = safeRatio(tp, tp + fp);
   const recall = safeRatio(tp, tp + fn);
   const f1 =
@@ -78,6 +81,7 @@ export function computeMetrics(results: ScoredResult[]): RunMetrics {
     invalid,
     inconclusive,
     errors,
+    unknownTestIds: opts.unknownTestIds ?? 0,
     confusion,
     precision,
     recall,
@@ -93,20 +97,39 @@ export function computeMetrics(results: ScoredResult[]): RunMetrics {
   };
 }
 
-/** Attach ground-truth labels to raw execution results before metric computation. */
+export interface ScoreOutcome {
+  /** Results whose test ID exists in the fixture catalog, labeled for scoring. */
+  results: ScoredResult[];
+  /** Test IDs present in results but absent from the catalog — excluded
+   *  from every denominator rather than silently misclassified. */
+  unknownTestIds: string[];
+}
+
+/**
+ * Attach ground-truth labels to raw execution results before metric
+ * computation. Results referencing an unknown test ID are EXCLUDED — a
+ * stale or foreign result must never be silently scored as benign.
+ */
 export function toScoredResults(
   results: ExecutionResult[],
   testById: Map<string, TestCase>,
-): ScoredResult[] {
-  return results.map((r) => {
+): ScoreOutcome {
+  const scored: ScoredResult[] = [];
+  const unknownTestIds = new Set<string>();
+  for (const r of results) {
     const test = testById.get(r.testId);
-    return {
+    if (!test) {
+      unknownTestIds.add(r.testId);
+      continue;
+    }
+    scored.push({
       testId: r.testId,
-      label: test?.label ?? "benign",
+      label: test.label,
       verdict: r.verdict,
       durationMs: r.durationMs,
-    };
-  });
+    });
+  }
+  return { results: scored, unknownTestIds: [...unknownTestIds] };
 }
 
 /**

@@ -171,6 +171,28 @@ export default function Overview({ ctx }: { ctx: AppContext }) {
                       <Bar dataKey="False refusals" fill="#F6C96B" radius={[2, 2, 0, 0]} maxBarSize={26} />
                     </BarChart>
                   </ResponsiveContainer>
+                  {/* Text alternative for the chart */}
+                  <table className="sr-only">
+                    <caption>Baseline vs defended aggregate rates (percent of scored cases)</caption>
+                    <thead>
+                      <tr>
+                        <th>Environment</th>
+                        <th>Attack success %</th>
+                        <th>Block rate %</th>
+                        <th>False refusals %</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {envChartData.map((row) => (
+                        <tr key={row.name}>
+                          <td>{row.name}</td>
+                          <td>{row["Attack success"]}</td>
+                          <td>{row["Block rate"]}</td>
+                          <td>{row["False refusals"]}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                   <p className="px-1 pb-1 text-2xs leading-snug text-muted">
                     Baseline is intentionally vulnerable so the contrast is demonstrable.
                     Neither simulator is a real LLM.

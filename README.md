@@ -29,10 +29,11 @@ npm run build
 npm start          # serves API + built client on http://localhost:8787
 ```
 
-Tests and typecheck:
+Tests, lint and typecheck:
 
 ```bash
-npm test           # vitest — 29 unit tests
+npm test           # vitest — unit + API integration tests
+npm run lint       # eslint (flat config)
 npm run typecheck
 ```
 
@@ -97,6 +98,21 @@ tests/               vitest unit tests
 - The synthetic canary is redacted in all stored evidence, logs and responses.
 - Server inputs are validated with zod; request bodies capped at 100 KB.
 - Baseline weakness is explicit, isolated and disclosed in the UI.
+- Security headers on every response: CSP, `X-Content-Type-Options`,
+  `X-Frame-Options`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`.
+- Rate limiting: `/api/investigate` 5/min, `/api/runs` 30/min, `/api/reset`
+  5/hour (HTTP 429 + `Retry-After`). **Per-process, in-memory** — suitable for
+  a single instance only; not a distributed limit.
+- `POST /api/reset` requires `{"confirm":"RESET"}`. This is an accident guard,
+  **not authentication** — behind any non-local deployment it needs real
+  access control.
+- `/api/health/status` reports component state only — no filesystem paths.
+- Metrics never silently classify unknown test IDs; they are excluded and
+  counted separately (`unknownTestIds`).
+- Corrupt storage is quarantined and logged (without contents) instead of
+  silently discarded.
+- Gemini calls carry an `AbortSignal` timeout that cancels the underlying
+  request rather than just abandoning it.
 
 ## Threat model & limitations
 
@@ -112,7 +128,20 @@ tests/               vitest unit tests
 
 ## Test results
 
-`npm test` → **29/29 passing** covering: attack success detection, false-refusal
-detection, confusion matrix + derived metrics, division-by-zero handling, input
-validation, canary protection (output screening + evidence redaction), forbidden
-action blocking, and error/inconclusive handling.
+`npm test` → **50/50 passing**: 29 engine/metric unit tests + 17 API
+integration tests (validation, redaction, rerun, report, rate limiting, reset
+confirmation, header checks) + 4 metrics regression tests (unknown test IDs,
+empty/degenerate denominators). API tests run against an isolated temp data
+file and never touch developer data or the real Gemini API.
+
+## Known dependency residuals (audit, 2026-10-23)
+
+`npm audit --omit=dev` → 2 moderate (react-router 6.x advisories requiring the
+v7 major; the affected patterns — SSR hydration, navigation to
+attacker-controlled URLs — are not used by this app).
+
+Full `npm audit` → 21 remaining, all in **dev-tooling** chains: vitest/tinypool
+(critical, needs vitest ≥3), vite/esbuild (needs vite ≥6.4.4), tailwindcss v3
+chains (needs v4 major), typescript-eslint transitive micromatch/braces.
+These affect build/test tooling only and process no untrusted input; the
+major upgrades were deferred as breaking changes.

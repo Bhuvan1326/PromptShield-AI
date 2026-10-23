@@ -38,7 +38,7 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
       .listRuns()
       .then((r) => {
         setRuns(r);
-        if (r.length && !selectedId) setSelectedId(r[0].id);
+        setSelectedId((cur) => cur || r[0]?.id || "");
       })
       .catch((e) => setError(e.message));
   }, [ctx.refreshSignal]);
@@ -185,7 +185,7 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
                     <div className="text-2xs text-muted">TN · answered</div>
                   </div>
                 </div>
-                <div className="mt-4 grid grid-cols-3 gap-2 text-center text-2xs text-muted">
+                <div className="mt-4 grid grid-cols-2 gap-2 text-center text-2xs text-muted sm:grid-cols-4">
                   <div className="rounded border border-border bg-card py-1.5">
                     {m.invalid} robustness · excluded
                   </div>
@@ -194,6 +194,9 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
                   </div>
                   <div className="rounded border border-border bg-card py-1.5">
                     {m.errors} errors · excluded
+                  </div>
+                  <div className="rounded border border-border bg-card py-1.5">
+                    {m.unknownTestIds} unknown IDs · excluded
                   </div>
                 </div>
               </div>

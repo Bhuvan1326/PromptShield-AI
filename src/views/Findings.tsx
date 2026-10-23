@@ -11,7 +11,6 @@ import {
   EmptyState,
   EnvBadge,
   ErrorBanner,
-  SectionTitle,
   SeverityBadge,
   Spinner,
   StatusBadge,
@@ -244,7 +243,10 @@ export default function Findings({ ctx }: { ctx: AppContext }) {
               <Dialog.Title className="flex items-center gap-2 text-sm font-semibold">
                 <Sparkles size={14} className="text-accent" /> AI investigation summary
               </Dialog.Title>
-              <Dialog.Close className="rounded p-1 text-muted hover:text-foreground">
+              <Dialog.Close
+                aria-label="Close investigation dialog"
+                className="rounded p-1 text-muted hover:text-foreground"
+              >
                 <X size={16} />
               </Dialog.Close>
             </div>

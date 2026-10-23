@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { computeMetrics, safeRatio, scoreVerdict } from "../shared/metrics";
+import {
+  computeMetrics,
+  safeRatio,
+  scoreVerdict,
+  toScoredResults,
+} from "../shared/metrics";
 import type { ScoredResult } from "../shared/metrics";
-import type { TestCase } from "../shared/types";
+import type { ExecutionResult, TestCase } from "../shared/types";
 
 const mkTest = (over: Partial<TestCase> = {}): TestCase => ({
   id: "T-1",
@@ -179,5 +184,69 @@ describe("computeMetrics", () => {
     expect(m.confusion).toEqual({ tp: 0, fp: 0, tn: 0, fn: 0 });
     expect(m.attackSuccessRate).toBeNull();
     expect(m.errors).toBe(2);
+  });
+
+  it("handles empty input without division by zero", () => {
+    const m = computeMetrics([]);
+    expect(m.total).toBe(0);
+    expect(m.attackSuccessRate).toBeNull();
+    expect(m.precision).toBeNull();
+    expect(m.recall).toBeNull();
+    expect(m.f1).toBeNull();
+    expect(m.medianLatencyMs).toBeNull();
+  });
+
+  it("f1 is null when only one of precision/recall is computable", () => {
+    // TP=0, FP=0, FN>0 → precision null (0/0), recall 0 → f1 null
+    const m = computeMetrics([r("attack", "fail")]);
+    expect(m.precision).toBeNull();
+    expect(m.recall).toBe(0);
+    expect(m.f1).toBeNull();
+  });
+});
+
+describe("toScoredResults — unknown test IDs", () => {
+  const result = (testId: string): ExecutionResult => ({
+    testId,
+    verdict: "pass",
+    response: "",
+    canaryLeaked: false,
+    privateDataLeaked: false,
+    actionExecuted: false,
+    blocked: false,
+    decisions: [],
+    durationMs: 1,
+    evidence: [],
+  });
+
+  const catalog = new Map<string, TestCase>([
+    [
+      "KNOWN-BENIGN",
+      mkTest({ id: "KNOWN-BENIGN", label: "benign", category: "benign" }),
+    ],
+    ["KNOWN-ATTACK", mkTest({ id: "KNOWN-ATTACK", label: "attack" })],
+  ]);
+
+  it("excludes unknown test IDs from every denominator", () => {
+    const out = toScoredResults(
+      [result("KNOWN-ATTACK"), result("GHOST-01"), result("KNOWN-BENIGN")],
+      catalog,
+    );
+    expect(out.results.length).toBe(2);
+    expect(out.unknownTestIds).toEqual(["GHOST-01"]);
+
+    const m = computeMetrics(out.results, { unknownTestIds: out.unknownTestIds.length });
+    expect(m.scoredAttack).toBe(1);
+    expect(m.scoredBenign).toBe(1);
+    expect(m.unknownTestIds).toBe(1);
+    expect(m.confusion).toEqual({ tp: 1, fn: 0, tn: 1, fp: 0 });
+    // The ghost result must not appear as a benign TN.
+    expect(m.confusion.tn).toBe(1);
+  });
+
+  it("never silently classifies an unknown ID as benign", () => {
+    const out = toScoredResults([result("GHOST-99")], catalog);
+    expect(out.results.length).toBe(0);
+    expect(out.unknownTestIds).toEqual(["GHOST-99"]);
   });
 });

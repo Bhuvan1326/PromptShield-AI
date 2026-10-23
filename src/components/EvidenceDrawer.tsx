@@ -48,7 +48,10 @@ export function EvidenceDrawer({
                 )}
               </div>
             </div>
-            <Dialog.Close className="rounded p-1 text-muted hover:text-foreground">
+            <Dialog.Close
+              aria-label="Close evidence drawer"
+              className="rounded p-1 text-muted hover:text-foreground"
+            >
               <X size={16} />
             </Dialog.Close>
           </div>

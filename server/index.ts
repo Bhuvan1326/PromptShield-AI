@@ -15,8 +15,74 @@ import { buildOverview } from "./stats";
 import { geminiStatus, GeminiUnavailable, investigate } from "./gemini";
 import { id, store } from "./store";
 
-const app = express();
+export const app = express();
+app.disable("x-powered-by");
 app.use(express.json({ limit: "100kb" }));
+
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader(
+    "Content-Security-Policy",
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+    ].join("; "),
+  );
+  next();
+});
+
+function rateLimit(opts: { windowMs: number; max: number; scope: string }) {
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const sweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of hits) if (v.resetAt <= now) hits.delete(k);
+  }, 60_000);
+  sweeper.unref();
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const key = `${opts.scope}:${req.ip ?? "unknown"}`;
+    const now = Date.now();
+    let entry = hits.get(key);
+    if (!entry || entry.resetAt <= now) {
+      entry = { count: 0, resetAt: now + opts.windowMs };
+      hits.set(key, entry);
+    }
+    entry.count++;
+    res.setHeader("X-RateLimit-Limit", String(opts.max));
+    res.setHeader("X-RateLimit-Remaining", String(Math.max(0, opts.max - entry.count)));
+    if (entry.count > opts.max) {
+      res.setHeader("Retry-After", String(Math.ceil((entry.resetAt - now) / 1000)));
+      return res.status(429).json({ error: "Rate limit exceeded. Try again later." });
+    }
+    next();
+  };
+}
+
+// Gemini calls cost real quota — strictest limit. Harness runs and the
+// destructive reset are limited too, at looser bounds.
+const investigateLimit = rateLimit({
+  windowMs: 60_000,
+  max: Number(process.env.PS_RL_INVESTIGATE_MAX) || 5,
+  scope: "investigate",
+});
+const runsLimit = rateLimit({
+  windowMs: 60_000,
+  max: Number(process.env.PS_RL_RUNS_MAX) || 30,
+  scope: "runs",
+});
+const resetLimit = rateLimit({
+  windowMs: 3_600_000,
+  max: Number(process.env.PS_RL_RESET_MAX) || 5,
+  scope: "reset",
+});
 
 const PORT = Number(process.env.PORT) || 8787;
 const PROJECT_ID = "demo-project";
@@ -60,6 +126,7 @@ function runHarness(environment: Environment, testIds: string[], suiteLabel: str
 
   const finishedAt = new Date();
   const testMap = new Map(TEST_CASES.map((t) => [t.id, t]));
+  const scored = toScoredResults(results, testMap);
   const run: RunRecord = {
     id: id("run"),
     projectId: PROJECT_ID,
@@ -69,7 +136,9 @@ function runHarness(environment: Environment, testIds: string[], suiteLabel: str
     finishedAt: finishedAt.toISOString(),
     durationMs: finishedAt.getTime() - startedAt.getTime(),
     results,
-    metrics: computeMetrics(toScoredResults(results, testMap)),
+    metrics: computeMetrics(scored.results, {
+      unknownTestIds: scored.unknownTestIds.length,
+    }),
   };
   store.addRun(run);
 
@@ -106,7 +175,7 @@ app.get("/api/health/status", (_req, res) => {
       model: g.model,
       message: g.message,
     },
-    storage: { state: "ready", path: store.dataPath },
+    storage: { state: "ready", kind: store.storageKind },
     engine: { state: "ready", testCases: TEST_CASES.length },
   });
 });
@@ -119,7 +188,7 @@ app.get("/api/tests", (_req, res) => {
   });
 });
 
-app.post("/api/runs", (req, res) => {
+app.post("/api/runs", runsLimit, (req, res) => {
   const parsed = runSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid request" });
@@ -141,7 +210,7 @@ app.post("/api/runs", (req, res) => {
 
   try {
     res.json(runHarness(environment, testIds, suiteLabel));
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Harness execution failed" });
   }
 });
@@ -216,7 +285,7 @@ app.post("/api/findings/:id/rerun", (req, res) => {
   res.json({ run, result, finding: store.getFinding(finding.id) });
 });
 
-app.post("/api/investigate", async (req, res) => {
+app.post("/api/investigate", investigateLimit, async (req, res) => {
   const schema = z.object({ findingId: z.string().max(128) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "findingId required" });
@@ -265,7 +334,18 @@ app.get("/api/audit", (_req, res) => {
   res.json(store.listAudit());
 });
 
-app.post("/api/reset", (_req, res) => {
+// Destructive: requires an explicit, validated confirmation body. NOTE: the
+// confirmation string is an accident guard, not authentication — on any
+// non-local deployment this endpoint must sit behind real access control.
+const resetSchema = z.object({ confirm: z.literal("RESET") });
+
+app.post("/api/reset", resetLimit, (req, res) => {
+  const parsed = resetSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(400)
+      .json({ error: 'Reset requires a confirmation body: {"confirm":"RESET"}' });
+  }
   store.reset();
   store.audit({ type: "data_reset", detail: "All runs, findings and audit events cleared" });
   res.json({ ok: true });
@@ -280,9 +360,13 @@ if (existsSync(distDir)) {
   app.get("*", (_req, res) => res.sendFile(path.join(distDir, "index.html")));
 }
 
-app.listen(PORT, () => {
-  const g = geminiStatus();
-  // Never log env values — only configuration state.
-  console.log(`PromptShield API listening on http://localhost:${PORT}`);
-  console.log(`Gemini: ${g.configured ? `configured (${g.model})` : "not configured (deterministic mode)"}`);
-});
+// Tests import `app` and drive it through supertest — only listen when run
+// as a server, never inside the test worker.
+if (!process.env.VITEST) {
+  app.listen(PORT, () => {
+    const g = geminiStatus();
+    // Never log env values — only configuration state.
+    console.log(`PromptShield API listening on http://localhost:${PORT}`);
+    console.log(`Gemini: ${g.configured ? `configured (${g.model})` : "not configured (deterministic mode)"}`);
+  });
+}

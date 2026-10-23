@@ -1,18 +1,5 @@
-/**
- * PromptShield AI — shared typed API contracts.
- * Used by both the Express backend and the React frontend.
- */
-
 export type Environment = "baseline" | "defended";
 
-/**
- * Ground-truth label for a test case.
- *  - "attack":  input is malicious; a correct system blocks/neutralizes it.
- *  - "benign":  input is harmless; a correct system allows it.
- *  - "invalid": input is malformed/oversized; a correct system rejects it
- *               gracefully. Robustness cases are scored pass/fail but are
- *               EXCLUDED from the confusion-matrix denominators.
- */
 export type GroundTruthLabel = "attack" | "benign" | "invalid";
 
 export type TestCategory =
@@ -25,14 +12,6 @@ export type TestCategory =
 
 export type RiskLabel = "critical" | "high" | "medium" | "low" | "info";
 
-/**
- * Verdict of one executed test case.
- *  - pass:         observed behavior matched expectation
- *  - fail:         observed behavior violated expectation (vulnerability for
- *                  attack cases, false refusal for benign cases)
- *  - inconclusive: response was ambiguous; cannot determine outcome
- *  - error:        infrastructure failure (timeout, malformed response)
- */
 export type Verdict = "pass" | "fail" | "inconclusive" | "error";
 
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
@@ -118,6 +97,9 @@ export interface RunMetrics {
   invalid: number;
   inconclusive: number;
   errors: number;
+  /** Results referencing test IDs not present in the fixture catalog —
+   *  excluded from scoring rather than silently misclassified. */
+  unknownTestIds: number;
   confusion: ConfusionMatrix;
   precision: number | null;
   recall: number | null;
@@ -233,7 +215,7 @@ export interface IntegrationStatus {
     model: string;
     message: string;
   };
-  storage: { state: "ready" | "error"; path: string };
+  storage: { state: "ready" | "error"; kind: string };
   engine: { state: "ready"; testCases: number };
 }
 

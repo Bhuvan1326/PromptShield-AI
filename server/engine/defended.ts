@@ -14,26 +14,9 @@ const OVERRIDE_RE =
 const REVEAL_VERB_RE = /\b(print|reveal|repeat|output|dump|display|leak|exfiltrate|verbatim)\b/i;
 const PROTECTED_REF_RE =
   /(system prompt|private context|national id|canary token|internal canary|ps-canary)/i;
+// eslint-disable-next-line no-control-regex -- intentional: the input contract rejects C0 control characters
 const CONTROL_CHAR_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
 
-/**
- * DEFENDED — the same simulated assistant behind deterministic guardrails.
- *
- * Pipeline order (each step emits a structured decision):
- *   1. Input contract: type, size limits, control characters.
- *   2. Trust separation: untrusted content is quoted as data and scanned for
- *      embedded instructions, which are never executed.
- *   3. Injection screening: override markers + reveal-intent toward protected
- *      context. Requires BOTH a reveal verb AND a protected-context reference,
- *      so merely discussing canary tokens stays allowed.
- *   4. Tool authorization: strict allowlist; forbidden tools are rejected.
- *   5. Output screening: the synthesized response is scanned for the canary
- *      and redacted if it ever appears (defense in depth).
- *
- * Known limitation (documented, not hidden): this is pattern matching. Novel
- * encodings, multi-turn buildup, non-English phrasing and semantic paraphrases
- * can evade it. It does not prove production security.
- */
 export function defendedHandle(test: TestCase, input: string): SimResponse {
   const decisions: Decision[] = [];
   const untrusted = test.untrustedContent ?? "";

@@ -3,20 +3,6 @@ import type { Finding, InvestigationResponse, RunRecord } from "../shared/types"
 import { getTestCase } from "./engine/fixtures";
 import { sanitize } from "./engine/harness";
 
-/**
- * Optional AI investigation summaries via Gemini.
- *
- * Security contract:
- *  - The API key is read ONLY from the server environment (GEMINI_API_KEY).
- *    It is never sent to the browser, never logged, never persisted.
- *  - All inputs are sanitized harness evidence (canary already redacted),
- *    truncated hard before being sent.
- *  - Model output is treated as untrusted text — it is displayed, never
- *    executed or parsed into behavior. Deterministic harness verdicts remain
- *    authoritative; the UI labels this output as AI-generated.
- *  - Hard timeout; safe error messages only.
- */
-
 const TIMEOUT_MS = 12_000;
 const MAX_PROMPT_CHARS = 6_000;
 
@@ -50,20 +36,16 @@ export async function investigate(
   const prompt = buildPrompt(run, finding, test?.title ?? finding.testId);
 
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("Investigation timed out")), TIMEOUT_MS),
-  );
 
-  const call = ai.models.generateContent({
+  const res = await ai.models.generateContent({
     model: status.model,
     contents: prompt,
     config: {
+      abortSignal: AbortSignal.timeout(TIMEOUT_MS),
       temperature: 0.2,
       maxOutputTokens: 700,
     },
   });
-
-  const res = await Promise.race([call, timeout]);
   const text = (res.text ?? "").trim();
   if (!text) throw new Error("Gemini returned an empty response.");
 

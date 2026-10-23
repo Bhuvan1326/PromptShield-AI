@@ -4,8 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { AuditEvent, AuditEventType, Finding, RunRecord } from "../shared/types";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, "data");
-const DB_PATH = path.join(DATA_DIR, "promptshield.json");
+const DEFAULT_DATA_DIR = path.join(__dirname, "data");
 
 interface Db {
   runs: RunRecord[];
@@ -13,14 +12,24 @@ interface Db {
   audit: AuditEvent[];
 }
 
-const empty: Db = { runs: [], findings: [], audit: [] };
+const empty = (): Db => ({ runs: [], findings: [], audit: [] });
 
-let db: Db = load();
+function dbPath(): string {
+  return process.env.PROMPTSHIELD_DB_PATH || path.join(DEFAULT_DATA_DIR, "promptshield.json");
+}
+
+let db: Db | null = null;
+
+function getDb(): Db {
+  if (!db) db = load();
+  return db;
+}
 
 function load(): Db {
+  const file = dbPath();
   try {
-    if (existsSync(DB_PATH)) {
-      const parsed = JSON.parse(readFileSync(DB_PATH, "utf8")) as Partial<Db>;
+    if (existsSync(file)) {
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<Db>;
       return {
         runs: Array.isArray(parsed.runs) ? parsed.runs : [],
         findings: Array.isArray(parsed.findings) ? parsed.findings : [],
@@ -28,16 +37,28 @@ function load(): Db {
       };
     }
   } catch {
-    // Corrupt store: start clean rather than crash the demo.
+    // Observable recovery: quarantine the unreadable file and warn — never
+    // silently discard data, never log its contents.
+    try {
+      const quarantine = `${file}.corrupt-${Date.now()}`;
+      renameSync(file, quarantine);
+      console.warn(
+        `[PromptShield] Stored data file was unreadable and was moved aside to ` +
+          `${path.basename(quarantine)}. Starting with an empty workspace.`,
+      );
+    } catch {
+      console.warn("[PromptShield] Stored data file was unreadable. Starting with an empty workspace.");
+    }
   }
-  return { ...empty };
+  return empty();
 }
 
 function persist() {
-  mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = DB_PATH + ".tmp";
-  writeFileSync(tmp, JSON.stringify(db, null, 2), "utf8");
-  renameSync(tmp, DB_PATH);
+  const file = dbPath();
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + ".tmp";
+  writeFileSync(tmp, JSON.stringify(getDb(), null, 2), "utf8");
+  renameSync(tmp, file);
 }
 
 export function id(prefix: string): string {
@@ -45,31 +66,32 @@ export function id(prefix: string): string {
 }
 
 export const store = {
-  dataPath: DB_PATH,
+  /** Coarse descriptor only — never expose the on-disk path via the API. */
+  storageKind: "local-json-file",
 
   addRun(run: RunRecord) {
-    db.runs.unshift(run);
+    getDb().runs.unshift(run);
     persist();
   },
-  getRun(id: string) {
-    return db.runs.find((r) => r.id === id);
+  getRun(runId: string) {
+    return getDb().runs.find((r) => r.id === runId);
   },
   listRuns() {
-    return db.runs;
+    return getDb().runs;
   },
 
   addFindings(findings: Finding[]) {
-    db.findings.unshift(...findings);
+    getDb().findings.unshift(...findings);
     persist();
   },
   listFindings() {
-    return db.findings;
+    return getDb().findings;
   },
-  getFinding(id: string) {
-    return db.findings.find((f) => f.id === id);
+  getFinding(findingId: string) {
+    return getDb().findings.find((f) => f.id === findingId);
   },
-  updateFinding(id: string, patch: Partial<Finding>) {
-    const f = db.findings.find((x) => x.id === id);
+  updateFinding(findingId: string, patch: Partial<Finding>) {
+    const f = getDb().findings.find((x) => x.id === findingId);
     if (f) {
       Object.assign(f, patch);
       persist();
@@ -78,17 +100,17 @@ export const store = {
   },
 
   audit(event: Omit<AuditEvent, "id" | "at"> & { type: AuditEventType }) {
-    db.audit.unshift({ ...event, id: id("evt"), at: new Date().toISOString() });
+    getDb().audit.unshift({ ...event, id: id("evt"), at: new Date().toISOString() });
     // Cap the log so the file stays bounded during a demo.
-    if (db.audit.length > 500) db.audit.length = 500;
+    if (getDb().audit.length > 500) getDb().audit.length = 500;
     persist();
   },
   listAudit() {
-    return db.audit;
+    return getDb().audit;
   },
 
   reset() {
-    db = { ...empty };
+    db = empty();
     persist();
   },
 };

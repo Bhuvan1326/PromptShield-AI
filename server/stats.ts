@@ -25,15 +25,18 @@ export function buildOverview(): OverviewStats {
 
   const allResults = runs.flatMap((r) => r.results);
   const allScored = toScoredResults(allResults, testMap);
-  const overall = computeMetrics(allScored);
+  const overall = computeMetrics(allScored.results, {
+    unknownTestIds: allScored.unknownTestIds.length,
+  });
 
   const envMetrics = (env: RunRecord["environment"]): RunMetrics | null => {
     const envResults = runs.filter((r) => r.environment === env).flatMap((r) => r.results);
     if (envResults.length === 0) return null;
-    return computeMetrics(toScoredResults(envResults, testMap));
+    const scored = toScoredResults(envResults, testMap);
+    return computeMetrics(scored.results, { unknownTestIds: scored.unknownTestIds.length });
   };
 
-  const confirmedAttackSuccesses = allScored.filter(
+  const confirmedAttackSuccesses = allScored.results.filter(
     (s) => s.label === "attack" && s.verdict === "fail",
   ).length;
 
