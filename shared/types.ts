@@ -81,6 +81,8 @@ export interface RunRecord {
   durationMs: number;
   results: ExecutionResult[];
   metrics: RunMetrics;
+  /** Set when this run was produced by an agent session — explicit link. */
+  agentSessionId?: string;
 }
 
 export interface ConfusionMatrix {

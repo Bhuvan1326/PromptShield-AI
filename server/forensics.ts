@@ -62,7 +62,7 @@ export function buildForensicRecord(finding: Finding, run: RunRecord, test: Test
   return {
     findingId: finding.id,
     runId: run.id,
-    sessionId: run.suite === "agent" ? run.id : undefined,
+    sessionId: run.agentSessionId,
     traceId: `${run.id}/${finding.testId}`,
     testId: finding.testId,
     severity: finding.severity,

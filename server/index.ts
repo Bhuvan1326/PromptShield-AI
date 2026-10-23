@@ -24,11 +24,11 @@ import {
 } from "./agent/session";
 import {
   abandonIdempotency,
+  finalizeIdempotency,
   IDEM_KEY_RE,
   idemScope,
-  lookupIdempotency,
-  recordIdempotency,
   requestFingerprint,
+  reserveIdempotency,
 } from "./idempotency";
 import { buildAttackGraph } from "./graph";
 import { buildForensicRecord } from "./forensics";
@@ -445,27 +445,35 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
   const { environment, preset } = parsed.data;
 
   // --- Idempotency-Key (optional, process-local) ---
+  // sessionId is allocated BEFORE the atomic reserve so in-flight duplicates
+  // replay the same id.
+  const sessionId = id("agent");
   const idemHeader = req.get("Idempotency-Key");
   let scopeKey: string | null = null;
-  let fingerprint = "";
   if (idemHeader !== undefined) {
     if (!IDEM_KEY_RE.test(idemHeader)) {
       return res.status(400).json({ error: "Idempotency-Key must be 8-128 chars of [A-Za-z0-9_-]" });
     }
-    fingerprint = requestFingerprint(parsed.data);
+    const fingerprint = requestFingerprint(parsed.data);
     scopeKey = idemScope(owner, "agent_sessions", idemHeader);
-    const existing = lookupIdempotency(scopeKey);
-    if (existing) {
-      if (existing.fingerprint !== fingerprint) {
-        return res.status(409).json({ error: "Idempotency-Key was already used with a different request." });
-      }
-      const existingSession = store.getAgentSession(existing.sessionId);
+    const reserved = reserveIdempotency(scopeKey, fingerprint, sessionId);
+    if (reserved.kind === "conflict") {
+      return res.status(409).json({ error: "Idempotency-Key was already used with a different request." });
+    }
+    if (reserved.kind === "replay") {
+      const existingSession = store.getAgentSession(reserved.sessionId);
       if (existingSession) {
         // Replay — no new session, no slot, no duplicate audit event.
         return res.status(200).set("Idempotency-Replayed", "true").json(existingSession);
       }
-      // Stored session was trimmed from retention — treat as new.
+      // In-flight sibling hasn't persisted yet, or its record was trimmed:
+      // return the id so the client can poll the same session.
+      return res
+        .status(202)
+        .set("Idempotency-Replayed", "true")
+        .json({ id: reserved.sessionId, status: "running" });
     }
+    // "reserved" — we own the slot; finalize on success, abandon on failure.
   }
 
   // Read-only precheck only — runAgent is the sole owner of slot
@@ -475,7 +483,6 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
     if (scopeKey) abandonIdempotency(scopeKey);
     return res.status(429).json({ error: "Concurrent session limit reached for this client." });
   }
-  const sessionId = id("agent");
 
   const session = {
     id: sessionId,
@@ -503,7 +510,7 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
     if (scopeKey) abandonIdempotency(scopeKey);
     return res.status(500).json({ error: "Failed to create agent session" });
   }
-  if (scopeKey) recordIdempotency(scopeKey, fingerprint, sessionId);
+  if (scopeKey) finalizeIdempotency(scopeKey);
   store.audit({
     type: "agent_session",
     environment,
@@ -554,6 +561,7 @@ app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => 
       durationMs: Date.now() - new Date(session.budget.startedAt).getTime(),
       results,
       metrics: computeMetrics(scored.results, { unknownTestIds: scored.unknownTestIds.length }),
+      agentSessionId: session.id,
     };
     store.addRun(run);
     const fs = findingsFromRun(run, results);

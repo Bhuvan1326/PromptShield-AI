@@ -155,21 +155,14 @@ export default function AttackGraphView({ ctx: _ctx }: { ctx: AppContext }) {
                 const p = layout!.pos.get(n.id)!;
                 const chained = inChain.has(n.id);
                 return (
-                  <g
-                    key={n.id}
-                    transform={`translate(${p.x},${p.y})`}
-                    onClick={() => setSelected(n)}
-                    onKeyDown={(e) => e.key === "Enter" && setSelected(n)}
-                    role="button"
-                    tabIndex={0}
-                    aria-label={`Node ${n.label}`}
-                    className="cursor-pointer focus:outline-none"
-                  >
+                  <g key={n.id} transform={`translate(${p.x},${p.y})`}>
                     <rect
                       width={140}
                       height={28}
                       rx={5}
-                      className={clsx(TYPE_COLOR[n.type], chained && "stroke-danger")}
+                      aria-hidden="true"
+                      onClick={() => setSelected(n)}
+                      className={clsx(TYPE_COLOR[n.type], chained && "stroke-danger", "cursor-pointer")}
                       strokeWidth={chained ? 1.5 : 1}
                     />
                     <text x={8} y={17} fontSize={9.5} className="fill-foreground" fontFamily="ui-monospace">
@@ -201,6 +194,27 @@ export default function AttackGraphView({ ctx: _ctx }: { ctx: AppContext }) {
                   </button>
                 ))}
               </div>
+            </Card>
+          )}
+
+          {graph && (
+            <Card>
+              <SectionTitle title="All nodes" subtitle="keyboard-accessible alternative to the graph" />
+              <ul className="max-h-48 space-y-0.5 overflow-y-auto p-2">
+                {graph.nodes.map((n) => (
+                  <li key={n.id}>
+                    <button
+                      onClick={() => setSelected(n)}
+                      className={clsx(
+                        "w-full rounded px-2 py-1 text-left font-mono text-2xs hover:bg-card",
+                        selected?.id === n.id ? "bg-accent/10 text-accent" : "text-foreground/80",
+                      )}
+                    >
+                      <span className="text-indigo">{n.type}</span> {n.label}
+                    </button>
+                  </li>
+                ))}
+              </ul>
             </Card>
           )}
 

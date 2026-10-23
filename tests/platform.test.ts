@@ -329,18 +329,23 @@ describe("idempotency store (unit)", () => {
       expect(fp1).toBe(fp1b); // key-order-insensitive
       expect(fp1).not.toBe(fp2);
 
-      idem.recordIdempotency(scopeA, fp1, "sess-1");
-      expect(idem.lookupIdempotency(scopeA)?.sessionId).toBe("sess-1");
-      expect(idem.lookupIdempotency(scopeB)).toBeNull();
+      // Atomic reserve: first caller reserves, second identical caller replays
+      // the in-flight record, a different fingerprint conflicts.
+      expect(idem.reserveIdempotency(scopeA, fp1, "sess-1")).toEqual({ kind: "reserved" });
+      expect(idem.reserveIdempotency(scopeA, fp1, "other")).toEqual({ kind: "replay", sessionId: "sess-1" });
+      expect(idem.reserveIdempotency(scopeA, fp2, "other")).toEqual({ kind: "conflict" });
+      idem.finalizeIdempotency(scopeA);
+      expect(idem.reserveIdempotency(scopeB, fp1, "sess-b")).toEqual({ kind: "reserved" });
 
       // Past the 60s window the key is reusable.
       vi.advanceTimersByTime(61_000);
-      expect(idem.lookupIdempotency(scopeA)).toBeNull();
-      idem.recordIdempotency(scopeA, fp2, "sess-2");
-      expect(idem.lookupIdempotency(scopeA)?.sessionId).toBe("sess-2");
+      expect(idem.reserveIdempotency(scopeA, fp2, "sess-2")).toEqual({ kind: "reserved" });
+      idem.finalizeIdempotency(scopeA);
+      expect(idem.reserveIdempotency(scopeA, fp2, "x")).toEqual({ kind: "replay", sessionId: "sess-2" });
 
+      // Abandon releases the key for a retry after failure.
       idem.abandonIdempotency(scopeA);
-      expect(idem.lookupIdempotency(scopeA)).toBeNull();
+      expect(idem.reserveIdempotency(scopeA, fp1, "sess-3")).toEqual({ kind: "reserved" });
     } finally {
       vi.useRealTimers();
     }

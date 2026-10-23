@@ -1,27 +1,35 @@
 import { createHash } from "node:crypto";
 
 /**
- * Idempotency-Key support — PROCESS-LOCAL, in-memory records.
+ * Idempotency-Key support — PROCESS-LOCAL, in-memory records with an
+ * atomic reservation state machine.
  *
  * Semantics:
  *   - Scoped to (owner, route, key) — one owner can never see or replay
  *     another owner's key.
  *   - 60-second window, bounded map (records swept on access + oldest evicted
  *     past MAX_RECORDS — memory stays bounded).
- *   - Same scope + same request fingerprint → replay the stored session id.
- *   - Same scope + different fingerprint → caller gets 409.
- *   - A record is only written AFTER the session object exists; failures call
- *     abandon() so the key isn't poisoned and a retry can proceed.
+ *   - reserve() is a single synchronous check-and-set: it either replays an
+ *     existing record, reports a fingerprint conflict, or atomically takes
+ *     the slot in 'in_flight' state carrying the pre-allocated sessionId —
+ *     so concurrent identical requests all converge on ONE session id even
+ *     while creation is still in flight.
+ *   - finalize() marks the record stored; abandon() drops it so failures
+ *     never poison a key (a retry can proceed).
+ *   - Same scope + different fingerprint → 409.
  *
  * LIMITATION: records live in this process's memory — they do NOT provide
- * distributed idempotency across multiple server instances. For that, the
- * record store must move to an atomic shared store (e.g. Redis SET NX PX
- * with a Lua check-and-set) — documented, not implemented.
+ * distributed idempotency across multiple server instances. That requires
+ * an atomic shared store (e.g. Redis `SET NX PX` with a Lua compare-and-
+ * finalize, or a DB unique-constraint upsert) — documented, not implemented.
  */
+
+type IdemState = "in_flight" | "stored";
 
 interface IdemRecord {
   fingerprint: string;
   sessionId: string;
+  state: IdemState;
   expiresAt: number;
 }
 
@@ -36,7 +44,7 @@ export function idemScope(owner: string, route: string, key: string): string {
   return `${owner}|${route}|${key}`;
 }
 
-/** Canonical request fingerprint — key order normalized. */
+/** Canonical request fingerprint — key order normalized; arrays keep order. */
 export function requestFingerprint(body: unknown): string {
   const canon = (v: unknown): unknown =>
     v && typeof v === "object" && !Array.isArray(v)
@@ -58,20 +66,47 @@ function sweep() {
   }
 }
 
-/** Look up a scope key. Returns the record, or null. */
-export function lookupIdempotency(scopeKey: string): IdemRecord | null {
+export type ReserveResult =
+  | { kind: "reserved" }
+  | { kind: "replay"; sessionId: string }
+  | { kind: "conflict" };
+
+/**
+ * Atomic check-and-set. Call with the sessionId BEFORE creation begins:
+ *   - "reserved" → caller owns the reservation; must finalize() on success or
+ *     abandon() on failure.
+ *   - "replay"   → a record already exists (stored or in-flight); return its
+ *     sessionId — do not create anything.
+ *   - "conflict" → same key, different request fingerprint → 409.
+ */
+export function reserveIdempotency(
+  scopeKey: string,
+  fingerprint: string,
+  sessionId: string,
+): ReserveResult {
   sweep();
   const rec = records.get(scopeKey);
-  return rec && rec.expiresAt > Date.now() ? rec : null;
+  if (rec && rec.expiresAt > Date.now()) {
+    return rec.fingerprint === fingerprint
+      ? { kind: "replay", sessionId: rec.sessionId }
+      : { kind: "conflict" };
+  }
+  records.set(scopeKey, {
+    fingerprint,
+    sessionId,
+    state: "in_flight",
+    expiresAt: Date.now() + TTL_MS,
+  });
+  return { kind: "reserved" };
 }
 
-/** Record a successful session creation under this key. */
-export function recordIdempotency(scopeKey: string, fingerprint: string, sessionId: string) {
-  sweep();
-  records.set(scopeKey, { fingerprint, sessionId, expiresAt: Date.now() + TTL_MS });
+/** Mark a reservation's session as durably created. */
+export function finalizeIdempotency(scopeKey: string) {
+  const rec = records.get(scopeKey);
+  if (rec) rec.state = "stored";
 }
 
-/** Drop the record — called when creation failed so retries aren't poisoned. */
+/** Drop the record — called on failure so retries aren't poisoned. */
 export function abandonIdempotency(scopeKey: string) {
   records.delete(scopeKey);
 }
