@@ -1,4 +1,4 @@
-import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { lazy, Suspense, useEffect, useState, type Dispatch, type SetStateAction } from "react";
 import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import {
   ClipboardList,
@@ -9,12 +9,15 @@ import {
 } from "lucide-react";
 import { api, type Catalog } from "./lib/api";
 import type { Environment, IntegrationStatus } from "@shared/types";
-import Overview from "./views/Overview";
-import TestLab from "./views/TestLab";
-import Findings from "./views/Findings";
-import Evaluation from "./views/Evaluation";
-import Audit from "./views/Audit";
 import { EnvBadge, Spinner } from "./components/ui";
+
+// Route-level code splitting: each view (and heavy deps like recharts, which
+// only Overview uses) loads on demand instead of inflating the entry bundle.
+const Overview = lazy(() => import("./views/Overview"));
+const TestLab = lazy(() => import("./views/TestLab"));
+const Findings = lazy(() => import("./views/Findings"));
+const Evaluation = lazy(() => import("./views/Evaluation"));
+const Audit = lazy(() => import("./views/Audit"));
 
 const NAV = [
   { to: "/", label: "Overview", icon: Gauge, end: true },
@@ -173,13 +176,21 @@ export default function App() {
             </div>
           )}
           {ctx && (
-            <Routes>
-              <Route path="/" element={<Overview ctx={ctx} />} />
-              <Route path="/lab" element={<TestLab ctx={ctx} />} />
-              <Route path="/findings" element={<Findings ctx={ctx} />} />
-              <Route path="/evaluation" element={<Evaluation ctx={ctx} />} />
-              <Route path="/audit" element={<Audit ctx={ctx} />} />
-            </Routes>
+            <Suspense
+              fallback={
+                <div className="flex h-64 items-center justify-center">
+                  <Spinner label="Loading view…" />
+                </div>
+              }
+            >
+              <Routes>
+                <Route path="/" element={<Overview ctx={ctx} />} />
+                <Route path="/lab" element={<TestLab ctx={ctx} />} />
+                <Route path="/findings" element={<Findings ctx={ctx} />} />
+                <Route path="/evaluation" element={<Evaluation ctx={ctx} />} />
+                <Route path="/audit" element={<Audit ctx={ctx} />} />
+              </Routes>
+            </Suspense>
           )}
         </main>
       </div>

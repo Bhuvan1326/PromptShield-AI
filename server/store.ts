@@ -6,6 +6,13 @@ import type { AuditEvent, AuditEventType, Finding, RunRecord } from "../shared/t
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_DATA_DIR = path.join(__dirname, "data");
 
+// Bounded retention keeps the JSON file and memory footprint flat during
+// long demo sessions. Oldest entries are evicted; findings retain their own
+// evidence snapshot so eviction of the parent run does not corrupt them.
+const MAX_RUNS = 200;
+const MAX_FINDINGS = 500;
+const MAX_AUDIT_EVENTS = 500;
+
 interface Db {
   runs: RunRecord[];
   findings: Finding[];
@@ -70,7 +77,9 @@ export const store = {
   storageKind: "local-json-file",
 
   addRun(run: RunRecord) {
-    getDb().runs.unshift(run);
+    const d = getDb();
+    d.runs.unshift(run);
+    if (d.runs.length > MAX_RUNS) d.runs.length = MAX_RUNS;
     persist();
   },
   getRun(runId: string) {
@@ -81,7 +90,9 @@ export const store = {
   },
 
   addFindings(findings: Finding[]) {
-    getDb().findings.unshift(...findings);
+    const d = getDb();
+    d.findings.unshift(...findings);
+    if (d.findings.length > MAX_FINDINGS) d.findings.length = MAX_FINDINGS;
     persist();
   },
   listFindings() {
@@ -102,7 +113,7 @@ export const store = {
   audit(event: Omit<AuditEvent, "id" | "at"> & { type: AuditEventType }) {
     getDb().audit.unshift({ ...event, id: id("evt"), at: new Date().toISOString() });
     // Cap the log so the file stays bounded during a demo.
-    if (getDb().audit.length > 500) getDb().audit.length = 500;
+    if (getDb().audit.length > MAX_AUDIT_EVENTS) getDb().audit.length = MAX_AUDIT_EVENTS;
     persist();
   },
   listAudit() {

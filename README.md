@@ -103,9 +103,13 @@ tests/               vitest unit tests
 - Rate limiting: `/api/investigate` 5/min, `/api/runs` 30/min, `/api/reset`
   5/hour (HTTP 429 + `Retry-After`). **Per-process, in-memory** — suitable for
   a single instance only; not a distributed limit.
-- `POST /api/reset` requires `{"confirm":"RESET"}`. This is an accident guard,
-  **not authentication** — behind any non-local deployment it needs real
-  access control.
+- `POST /api/reset` requires `{"confirm":"RESET"}` **and** authorization: with
+  `PS_ADMIN_TOKEN` set, callers must present it via `x-admin-token`; otherwise
+  the endpoint is loopback-only (403 for non-local callers). The confirmation
+  string alone is not authentication.
+- `trust proxy` is disabled: rate limits and loopback checks key off the real
+  socket peer and cannot be spoofed via `X-Forwarded-For`. Behind a reverse
+  proxy, set a specific trusted hop count — never `true`.
 - `/api/health/status` reports component state only — no filesystem paths.
 - Metrics never silently classify unknown test IDs; they are excluded and
   counted separately (`unknownTestIds`).
@@ -128,11 +132,14 @@ tests/               vitest unit tests
 
 ## Test results
 
-`npm test` → **50/50 passing**: 29 engine/metric unit tests + 17 API
-integration tests (validation, redaction, rerun, report, rate limiting, reset
-confirmation, header checks) + 4 metrics regression tests (unknown test IDs,
-empty/degenerate denominators). API tests run against an isolated temp data
-file and never touch developer data or the real Gemini API.
+`npm test` → **61/61 passing**: 16 engine harness tests + 19 metrics tests
+(unknown IDs, duplicates, empty/degenerate denominators) + 20 API integration
+tests (validation, oversized payloads, redaction, rerun, report, rate limiting
++ recovery, reset confirmation + admin-token authorization, header checks,
+X-Forwarded-For spoof rejection) + 6 Gemini tests (mocked SDK: success,
+abort-signal propagation, hang timeout, provider errors, fallback). API tests
+run against an isolated temp data file — developer data and the real Gemini
+API are never touched.
 
 ## Known dependency residuals (audit, 2026-10-23)
 

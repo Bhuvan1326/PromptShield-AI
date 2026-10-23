@@ -25,6 +25,13 @@ beforeAll(async () => {
     mkdtempSync(path.join(tmpdir(), "promptshield-test-")),
     "test-data.json",
   );
+  // Short rate-limit window so the recovery test doesn't need long sleeps;
+  // a low investigate max makes the 429 boundary deterministic.
+  process.env.PS_RL_WINDOW_MS = "400";
+  process.env.PS_RL_INVESTIGATE_MAX = "3";
+  // Keep reset's own limiter out of the way — the suite makes ~7 reset calls.
+  process.env.PS_RL_RESET_MAX = "50";
+  delete process.env.PS_ADMIN_TOKEN;
   const mod = await import("../server/index");
   app = mod.app;
 });
@@ -54,6 +61,14 @@ describe("POST /api/runs", () => {
       .post("/api/runs")
       .send({ environment: "bogus", suiteId: "full" });
     expect(res.status).toBe(400);
+  });
+
+  it("rejects oversized payloads (413)", async () => {
+    const res = await request(app)
+      .post("/api/runs")
+      .set("Content-Type", "application/json")
+      .send(JSON.stringify({ environment: "baseline", testId: "PS-BEN-01", pad: "x".repeat(120_000) }));
+    expect(res.status).toBe(413);
   });
 
   it("rejects missing suiteId/testId", async () => {
@@ -172,25 +187,63 @@ describe("POST /api/reset", () => {
     const runs = await request(app).get("/api/runs");
     expect(runs.body.length).toBe(0);
   });
+
+  it("enforces admin-token authorization when PS_ADMIN_TOKEN is set", async () => {
+    process.env.PS_ADMIN_TOKEN = "test-admin-token";
+    try {
+      const noToken = await request(app).post("/api/reset").send({ confirm: "RESET" });
+      expect(noToken.status).toBe(403);
+      const wrongToken = await request(app)
+        .post("/api/reset")
+        .set("x-admin-token", "wrong")
+        .send({ confirm: "RESET" });
+      expect(wrongToken.status).toBe(403);
+      const rightToken = await request(app)
+        .post("/api/reset")
+        .set("x-admin-token", "test-admin-token")
+        .send({ confirm: "RESET" });
+      expect(rightToken.status).toBe(200);
+    } finally {
+      delete process.env.PS_ADMIN_TOKEN;
+    }
+  });
+
+  it("does not honor X-Forwarded-For spoofing (trust proxy disabled)", async () => {
+    // Even if a client claims a non-local IP, the socket peer is used — the
+    // loopback boundary cannot be bypassed by header spoofing.
+    const res = await request(app)
+      .post("/api/reset")
+      .set("X-Forwarded-For", "8.8.8.8")
+      .send({ confirm: "RESET" });
+    expect(res.status).toBe(200);
+  });
 });
 
 describe("rate limiting", () => {
-  it("returns 429 after the investigate limit is exceeded", async () => {
-    // Default investigate limit: 5/min. Seed one finding for valid IDs.
+  it("returns 429 after the investigate limit is exceeded, then recovers", async () => {
+    // Limit configured for tests: 3 requests / 400ms window.
     await request(app).post("/api/runs").send({ environment: "baseline", testId: "PS-INJ-01" });
     const findings = await request(app).get("/api/findings");
     const id = findings.body[0].id;
 
     const statuses: number[] = [];
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 5; i++) {
       const res = await request(app).post("/api/investigate").send({ findingId: id });
       statuses.push(res.status);
     }
-    // An earlier test already consumed one request from the same per-IP
-    // window, so the 429 boundary may fall inside this loop — assert the
-    // limiter engages and rejects the tail rather than asserting an index.
-    expect(statuses[statuses.length - 1]).toBe(429);
-    expect(statuses.filter((s) => s === 429).length).toBeGreaterThanOrEqual(1);
+    // Requests 4+ must be limited (the window covers all five fast calls).
+    expect(statuses.slice(3).some((s) => s === 429)).toBe(true);
     expect(statuses).not.toContain(500);
+
+    // A 429 carries retry guidance.
+    const limited = await request(app).post("/api/investigate").send({ findingId: id });
+    if (limited.status === 429) {
+      expect(Number(limited.headers["retry-after"])).toBeGreaterThan(0);
+    }
+
+    // After the 400ms window expires the client recovers (404/503, not 429).
+    await new Promise((r) => setTimeout(r, 500));
+    const recovered = await request(app).post("/api/investigate").send({ findingId: id });
+    expect(recovered.status).not.toBe(429);
   });
 });

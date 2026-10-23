@@ -249,4 +249,24 @@ describe("toScoredResults — unknown test IDs", () => {
     expect(out.results.length).toBe(0);
     expect(out.unknownTestIds).toEqual(["GHOST-99"]);
   });
+
+  it("counts duplicate executions independently (reruns are real data)", () => {
+    const out = toScoredResults(
+      [result("KNOWN-ATTACK"), result("KNOWN-ATTACK")],
+      catalog,
+    );
+    const m = computeMetrics(out.results);
+    // Two executions of the same case = two scored results, not deduped.
+    expect(m.scoredAttack).toBe(2);
+    expect(m.confusion.tp).toBe(2);
+  });
+
+  it("missing catalog entries produce partial metrics, not fabricated coverage", () => {
+    // Only 1 of 2 catalog tests executed → metrics reflect that subset.
+    const out = toScoredResults([result("KNOWN-ATTACK")], catalog);
+    const m = computeMetrics(out.results);
+    expect(m.total).toBe(1);
+    expect(m.scoredBenign).toBe(0);
+    expect(m.benignFalseRefusalRate).toBeNull();
+  });
 });

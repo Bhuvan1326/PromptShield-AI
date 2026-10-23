@@ -88,6 +88,7 @@ export default function Findings({ ctx }: { ctx: AppContext }) {
           </p>
         </div>
         <select
+          aria-label="Filter findings by status"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-xs text-foreground focus:border-accent/50 focus:outline-none"

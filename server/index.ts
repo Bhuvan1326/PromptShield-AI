@@ -17,6 +17,7 @@ import { id, store } from "./store";
 
 export const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", false);
 app.use(express.json({ limit: "100kb" }));
 
 app.use((_req, res, next) => {
@@ -24,6 +25,10 @@ app.use((_req, res, next) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  );
   res.setHeader(
     "Content-Security-Policy",
     [
@@ -67,19 +72,21 @@ function rateLimit(opts: { windowMs: number; max: number; scope: string }) {
 }
 
 // Gemini calls cost real quota — strictest limit. Harness runs and the
-// destructive reset are limited too, at looser bounds.
+// destructive reset are limited too, at looser bounds. PS_RL_WINDOW_MS exists
+// so tests can use a short window without timing-dependent sleeps.
+const rlWindow = (def: number) => Number(process.env.PS_RL_WINDOW_MS) || def;
 const investigateLimit = rateLimit({
-  windowMs: 60_000,
+  windowMs: rlWindow(60_000),
   max: Number(process.env.PS_RL_INVESTIGATE_MAX) || 5,
   scope: "investigate",
 });
 const runsLimit = rateLimit({
-  windowMs: 60_000,
+  windowMs: rlWindow(60_000),
   max: Number(process.env.PS_RL_RUNS_MAX) || 30,
   scope: "runs",
 });
 const resetLimit = rateLimit({
-  windowMs: 3_600_000,
+  windowMs: rlWindow(3_600_000),
   max: Number(process.env.PS_RL_RESET_MAX) || 5,
   scope: "reset",
 });
@@ -334,12 +341,34 @@ app.get("/api/audit", (_req, res) => {
   res.json(store.listAudit());
 });
 
-// Destructive: requires an explicit, validated confirmation body. NOTE: the
-// confirmation string is an accident guard, not authentication — on any
-// non-local deployment this endpoint must sit behind real access control.
+// Destructive: requires an explicit, validated confirmation body AND an
+// authorization check for the actual deployment model:
+//   - If PS_ADMIN_TOKEN is set, callers must present it in `x-admin-token`.
+//   - Otherwise the endpoint is restricted to loopback clients (the intended
+//     local-demo boundary). Non-local callers get 403 regardless of body.
+// The confirmation string alone is NOT treated as authentication.
+const LOOPBACK = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const resetSchema = z.object({ confirm: z.literal("RESET") });
 
-app.post("/api/reset", resetLimit, (req, res) => {
+function requireResetAuthorization(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+) {
+  const adminToken = process.env.PS_ADMIN_TOKEN;
+  if (adminToken) {
+    if (req.get("x-admin-token") !== adminToken) {
+      return res.status(403).json({ error: "Reset requires a valid admin token." });
+    }
+    return next();
+  }
+  if (!LOOPBACK.has(req.ip ?? "")) {
+    return res.status(403).json({ error: "Reset is restricted to local clients." });
+  }
+  next();
+}
+
+app.post("/api/reset", resetLimit, requireResetAuthorization, (req, res) => {
   const parsed = resetSchema.safeParse(req.body);
   if (!parsed.success) {
     return res

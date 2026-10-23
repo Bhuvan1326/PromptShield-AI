@@ -112,8 +112,15 @@ export default function Evaluation({ ctx }: { ctx: AppContext }) {
 
       <Card className="p-3">
         <div className="flex flex-wrap items-center gap-3">
-          <label className="text-2xs font-medium uppercase tracking-wider text-muted">Run</label>
+          <label
+            htmlFor="run-select"
+            className="text-2xs font-medium uppercase tracking-wider text-muted"
+          >
+            Run
+          </label>
           <select
+            id="run-select"
+            aria-label="Select run to evaluate"
             value={selectedId}
             onChange={(e) => setSelectedId(e.target.value)}
             className="max-w-md flex-1 rounded-md border border-border bg-card px-2.5 py-1.5 font-mono text-2xs text-foreground focus:border-accent/50 focus:outline-none"

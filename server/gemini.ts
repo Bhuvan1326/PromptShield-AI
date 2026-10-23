@@ -3,7 +3,7 @@ import type { Finding, InvestigationResponse, RunRecord } from "../shared/types"
 import { getTestCase } from "./engine/fixtures";
 import { sanitize } from "./engine/harness";
 
-const TIMEOUT_MS = 12_000;
+const TIMEOUT_MS = Number(process.env.PS_GEMINI_TIMEOUT_MS) || 12_000;
 const MAX_PROMPT_CHARS = 6_000;
 
 export function geminiStatus() {
