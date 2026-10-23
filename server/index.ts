@@ -118,6 +118,13 @@ const resetLimit = rateLimit({
   max: Number(process.env.PS_RL_RESET_MAX) || 5,
   scope: "reset",
 });
+// Dedicated scope for agent-session creation — independent from `runs` so
+// benchmark/firewall traffic can't starve (or be starved by) agent sessions.
+const agentLimit = rateLimit({
+  windowMs: rlWindow(60_000),
+  max: Number(process.env.PS_RL_AGENT_MAX) || 10,
+  scope: "agent",
+});
 
 const PORT = Number(process.env.PORT) || 8787;
 const PROJECT_ID = "demo-project";
@@ -436,7 +443,7 @@ const agentSchema = z.object({
   preset: z.enum(["quick", "standard", "deep"]),
 });
 
-app.post("/api/agent/sessions", runsLimit, requireApiToken, async (req, res) => {
+app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) => {
   const parsed = agentSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Provide environment and preset (quick|standard|deep)" });

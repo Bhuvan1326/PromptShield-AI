@@ -175,9 +175,14 @@ export default function AgentLab({ ctx }: { ctx: AppContext }) {
                 </p>
               )}
             </div>
+            {/* Compact SR announcement — announces step transitions only,
+                not the full re-rendered list (avoids announcement flooding). */}
+            <div role="status" aria-live="polite" className="sr-only">
+              {session.trace.length > 0 &&
+                `Step ${session.budget.stepsUsed} of ${session.budget.maxSteps} — ${session.trace[session.trace.length - 1]?.detail ?? ""}`}
+            </div>
             <div
               className="max-h-80 space-y-1 overflow-y-auto rounded-md border border-border bg-card p-2 font-mono text-2xs"
-              aria-live="polite"
               aria-label="Agent activity timeline"
             >
               {session.trace.map((t) => (

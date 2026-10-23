@@ -68,6 +68,15 @@ function load(): Db {
         benchmarkRuns: Array.isArray(parsed.benchmarkRuns) ? parsed.benchmarkRuns : [],
         auditChainAnchor: typeof parsed.auditChainAnchor === "string" ? parsed.auditChainAnchor : undefined,
       };
+      // Stale-session recovery: agent lifecycles are in-memory, so a session
+      // persisted as "running" can never resume after a process restart.
+      // Mark it honestly rather than leaving a zombie row.
+      for (const s of db.agentSessions) {
+        if (s.status === "running") {
+          s.status = "error";
+          s.stopReason = "process_exit";
+        }
+      }
       let prev = db.auditChainAnchor;
       for (const e of [...db.audit].reverse()) {
         const { hash: _h, ...body } = e;

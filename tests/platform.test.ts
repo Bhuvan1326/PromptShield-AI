@@ -3,7 +3,7 @@
  * Isolated temp storage; no external calls.
  */
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -349,5 +349,34 @@ describe("idempotency store (unit)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("stale-session recovery", () => {
+  it("a persisted 'running' session is marked process_exit on next load", async () => {
+    // Write a file directly with a running session, then re-import store fresh.
+    const file = path.join(mkdtempSync(path.join(tmpdir(), "ps-stale-")), "t.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        runs: [], findings: [], audit: [], benchmarkRuns: [],
+        agentSessions: [{
+          id: "agent-stale", environment: "baseline", preset: "quick",
+          status: "running", phase: "execute", currentStrategy: null,
+          attemptedTestIds: [], successfulTestIds: [], blockedCount: 0,
+          consecutiveBlocks: 0, findings: [], trace: [],
+          budget: { maxSteps: 4, maxMs: 15000, stepsUsed: 2, startedAt: new Date().toISOString() },
+          planningSource: "deterministic", stopReason: null,
+          createdAt: new Date().toISOString(), seed: "agent-stale",
+        }],
+      }),
+    );
+    vi.resetModules();
+    process.env.PROMPTSHIELD_DB_PATH = file;
+    const fresh = await import("../server/store");
+    const s = fresh.store.getAgentSession("agent-stale")!;
+    expect(s.status).toBe("error");
+    expect(s.stopReason).toBe("process_exit");
+    vi.resetModules();
   });
 });

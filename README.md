@@ -174,16 +174,17 @@ tests/               vitest unit tests
 
 ## Test results
 
-`npm test` → **97/97 passing**: 16 engine harness + 19 metrics (unknown IDs,
+`npm test` → **119/119 passing** (8 files): 16 engine harness + 19 metrics (unknown IDs,
 duplicates, missing results, zero denominators) + 29 API integration
 (validation, 413 oversized, redaction, rerun, report, rate limiting +
 recovery, reset + API-token authorization, XFF spoof rejection, headers,
 firewall/benchmark/defense-lab/forensics/graph endpoints, agent lifecycle) +
-6 mocked-Gemini + 8 mocked AI-evaluation + 15 platform unit tests (firewall
-rules incl. approval replay, agent lifecycle/adaptation/cancellation, graph
-chains, forensics, benchmark scoring) + 4 axe-core accessibility tests
-(jsdom). API tests run against an isolated temp data file — developer data
-and the real Gemini API are never touched.
+6 mocked-Gemini + 8 mocked AI-evaluation + 21 platform unit tests (firewall
+rules incl. approval replay, agent lifecycle/adaptation/cancellation/
+concurrency, graph chains, forensics, benchmark scoring, idempotency) +
+3 AI-output-quality dataset tests + 12 axe-core accessibility tests across
+all views (jsdom). API tests run against an isolated temp data file —
+developer data and the real Gemini API are never touched.
 
 ## Known dependency residuals (audit, 2026-10-23)
 

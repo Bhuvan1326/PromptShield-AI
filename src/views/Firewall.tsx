@@ -160,7 +160,12 @@ export default function Firewall({ ctx: _ctx }: { ctx: AppContext }) {
 
           <Card>
             <SectionTitle title="Decision log" subtitle="most recent first" />
-            <div className="max-h-64 space-y-1.5 overflow-y-auto p-3" aria-live="polite">
+            {/* Announce only the newest decision — not the whole list. */}
+            <div role="status" aria-live="polite" className="sr-only">
+              {decisions.length > 0 &&
+                `Decision ${decisions[0].result} for ${decisions[0].tool}: ${decisions[0].reason}`}
+            </div>
+            <div className="max-h-64 space-y-1.5 overflow-y-auto p-3">
               {decisions.length === 0 && <p className="text-2xs text-muted">No evaluations yet.</p>}
               {decisions.map((d) => {
                 const S = RESULT_STYLE[d.result];
