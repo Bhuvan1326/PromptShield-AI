@@ -74,7 +74,7 @@ export function acquireOwnerSlot(owner: string): boolean {
   return true;
 }
 
-function releaseOwnerSlot(owner: string) {
+export function releaseOwnerSlot(owner: string) {
   activeByOwner.set(owner, Math.max(0, ownerActiveCount(owner) - 1));
 }
 
@@ -178,6 +178,12 @@ export async function runAgent(opts: {
   preset: AgentPreset;
   owner: string;
   onStep?: (s: AgentSession) => void;
+  /** Optional shared coordinator (Redis for multi-instance). Defaults to the
+   *  process-local owner-slot map — identical to prior behavior. */
+  coordinator?: {
+    acquireSlot(owner: string): Promise<boolean>;
+    releaseSlot(owner: string): Promise<void>;
+  };
 }): Promise<AgentRunResult> {
   const budget = PRESETS[opts.preset];
   const startedAt = Date.now();
@@ -210,8 +216,14 @@ export async function runAgent(opts: {
 
   // OWNER-SLOT LIFECYCLE: runAgent is the sole owner — acquire here, release
   // exactly once in finally below. A failed acquire NEVER releases (it owns
-  // nothing) and NEVER registers a firewall session.
-  if (!acquireOwnerSlot(opts.owner)) {
+  // nothing) and NEVER registers a firewall session. When a shared
+  // coordinator is injected (multi-instance), its acquire is awaited — the
+  // lifecycle contract is unchanged.
+  const coord = opts.coordinator;
+  const acquired = coord
+    ? await coord.acquireSlot(opts.owner)
+    : acquireOwnerSlot(opts.owner);
+  if (!acquired) {
     session.status = "error";
     session.phase = "done";
     session.stopReason = "concurrency_limit";
@@ -332,7 +344,8 @@ export async function runAgent(opts: {
     session.currentStrategy = null;
     cancelFlags.delete(session.id);
     closeSession(session.id);
-    releaseOwnerSlot(opts.owner);
+    if (coord) await coord.releaseSlot(opts.owner);
+    else releaseOwnerSlot(opts.owner);
     step(session, {
       phase: "done",
       detail: `Session ${session.status}: ${session.stopReason} — ${session.budget.stepsUsed} step(s), ${session.successfulTestIds.length} verified success(es), ${session.blockedCount} blocked`,

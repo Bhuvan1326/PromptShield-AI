@@ -36,10 +36,16 @@ Method: `scripts/perf.mjs`, warmup excluded, 60 sequential samples per endpoint
 
 | Operation | n | p50 | p95 | p99 |
 |---|---|---|---|---|
-| `POST /api/firewall/evaluate` | 60 | 5.1 ms | 6.7 ms | 22.4 ms |
-| `GET /api/health/status` | 60 | 0.4 ms | 0.7 ms | 1.0 ms |
-| `POST /api/runs` (10 tests + persist) | 8 | 83 ms | — | 95.8 ms max |
-| Agent quick session (baseline, 4 steps) | 1 | 136 ms end-to-end, 18 trace events | | |
+| `POST /api/firewall/evaluate` | 60 | 11.5 ms | 13.6 ms | 17.9 ms |
+| `GET /api/health/status` | 60 | 0.4 ms | 0.6 ms | 0.9 ms |
+| `POST /api/runs` (10 tests + persist) | 8 | 14.9 ms | — | 15.9 ms max |
+| Agent quick session (baseline, 4 steps) | 1 | 155 ms end-to-end, 18 trace events | | |
+
+`POST /api/runs` improved **83 ms → 14.9 ms p50 (~5.6×)**: root cause was a
+per-test `test_executed` audit → one full-file write per execution (12 writes
+per suite). `store.batch()` now defers all mutations in a synchronous critical
+section to a single atomic flush — durability and audit-chain semantics
+unchanged (verified by test).
 
 Memory (measurement host): RSS 68 MB. Frontend bundle: entry 187 KB gzipped 60 KB,
 all 10 views lazy-loaded.

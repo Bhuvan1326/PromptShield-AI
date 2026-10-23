@@ -13,7 +13,7 @@ import {
   Waypoints,
 } from "lucide-react";
 import { api, type Catalog } from "./lib/api";
-import type { Environment, IntegrationStatus } from "@shared/types";
+import type { Environment, IntegrationStatus, SessionStatus } from "@shared/types";
 import { EnvBadge, Spinner } from "./components/ui";
 
 // Route-level code splitting: each view (and heavy deps like recharts, which
@@ -70,7 +70,12 @@ export default function App() {
   const [environment, setEnvironment] = useState<Environment>("baseline");
   const [error, setError] = useState<string | null>(null);
   const [refreshSignal, setRefreshSignal] = useState(0);
+  const [session, setSession] = useState<SessionStatus | null>(null);
+  const [token, setToken] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
   const location = useLocation();
+
+  const refreshSession = () => api.session().then(setSession).catch(() => setSession(null));
 
   useEffect(() => {
     Promise.all([api.catalog(), api.status()])
@@ -79,7 +84,27 @@ export default function App() {
         setStatus(s);
       })
       .catch((e) => setError(e.message));
+    refreshSession();
   }, []);
+
+  const deployed = status?.auth?.mode === "deployed";
+
+  async function signIn(e: React.FormEvent) {
+    e.preventDefault();
+    setAuthError(null);
+    try {
+      const s = await api.login(token);
+      setSession(s);
+      setToken("");
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Sign-in failed");
+    }
+  }
+
+  async function signOut() {
+    await api.logout().catch(() => {});
+    setSession(null);
+  }
 
   const ctx: AppContext | null = catalog
     ? {
@@ -159,9 +184,46 @@ export default function App() {
               <span>{status ? `${status.engine.testCases} fixtures` : "—"}</span>
             </div>
           </div>
-          <p className="mt-3 border-t border-border/60 pt-2 text-2xs leading-snug text-muted/60">
+          <p className="mt-3 border-t border-border/60 pt-2 text-2xs leading-snug text-muted/80">
             Simulation harness · synthetic data only
           </p>
+          {deployed && (
+            <div className="mt-2 border-t border-border/60 pt-2">
+              {session?.authenticated ? (
+                <div className="flex items-center justify-between">
+                  <span className="text-2xs text-accent">Signed in ({session.role})</span>
+                  <button
+                    onClick={signOut}
+                    className="text-2xs text-muted underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    Sign out
+                  </button>
+                </div>
+              ) : (
+                <form onSubmit={signIn} className="space-y-1.5">
+                  <label htmlFor="op-token" className="text-2xs text-muted">
+                    Operator sign-in
+                  </label>
+                  <input
+                    id="op-token"
+                    type="password"
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                    placeholder="Operator token"
+                    autoComplete="off"
+                    className="w-full rounded border border-border bg-card px-2 py-1 text-2xs text-foreground placeholder:text-muted/50 focus:border-accent/50 focus:outline-none"
+                  />
+                  {authError && <p className="text-2xs text-danger">{authError}</p>}
+                  <button
+                    type="submit"
+                    className="rounded border border-border px-2 py-0.5 text-2xs text-muted hover:border-accent/50 hover:text-foreground"
+                  >
+                    Sign in
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
         </div>
       </aside>
 

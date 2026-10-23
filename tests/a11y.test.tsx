@@ -17,6 +17,7 @@ vi.mock("../src/lib/api", () => ({
       gemini: { state: "missing_key", model: "gemini-2.0-flash", message: "not configured" },
       storage: { state: "ready", kind: "local-json-file" },
       engine: { state: "ready", testCases: 10 },
+      auth: { mode: "local", sessionEnabled: true },
     })),
     overview: vi.fn(async () => ({
       totalRuns: 0,
@@ -115,6 +116,9 @@ vi.mock("../src/lib/api", () => ({
       metrics: {},
     })),
     auditVerify: vi.fn(async () => ({ valid: true, checked: 3 })),
+    session: vi.fn(async () => ({ authenticated: false, role: null, mode: "local" })),
+    login: vi.fn(),
+    logout: vi.fn(),
   },
 }));
 

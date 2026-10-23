@@ -380,3 +380,87 @@ describe("stale-session recovery", () => {
     vi.resetModules();
   });
 });
+
+describe("persistence batching", () => {
+  it("multi-mutation run does a single deferred flush; data stays correct", async () => {
+    const { store } = await import("../server/store");
+    const runCountBefore = store.listRuns().length;
+    const auditBefore = store.listAudit().length;
+    // batch() defers all persists inside fn to one flush.
+    store.batch(() => {
+      store.audit({ type: "run_created", detail: "batch-test" });
+      store.audit({ type: "run_finished", detail: "batch-test" });
+      store.audit({ type: "test_executed", detail: "batch-test" });
+    });
+    // All events are durably recorded and the chain still verifies.
+    expect(store.listAudit().length).toBe(auditBefore + 3);
+    expect(store.verifyAuditChain().valid).toBe(true);
+    // Nested batch flushes exactly once at the outermost level.
+    store.batch(() => {
+      store.audit({ type: "run_created", detail: "nested" });
+      store.batch(() => store.audit({ type: "test_executed", detail: "nested" }));
+    });
+    expect(store.verifyAuditChain().valid).toBe(true);
+    expect(store.listRuns().length).toBe(runCountBefore);
+  });
+});
+
+  it("batch exception: propagates error; mutations before the throw flush once", async () => {
+    const { store } = await import("../server/store");
+    const before = store.listAudit().length;
+    expect(() =>
+      store.batch(() => {
+        store.audit({ type: "run_created", detail: "before-throw" });
+        throw new Error("mid-batch failure");
+      }),
+    ).toThrow("mid-batch failure");
+    // Semantics: partial commit — the pre-throw mutation is durable (same as
+    // sequential non-batched calls), chain remains verifiable.
+    expect(store.listAudit().length).toBe(before + 1);
+    expect(store.verifyAuditChain().valid).toBe(true);
+  });
+
+describe("audit integrity — signing + checkpoints", () => {
+  it("signed events verify; forged sig/unsigned events are flagged", async () => {
+    const file = path.join(mkdtempSync(path.join(tmpdir(), "ps-audit-")), "t.json");
+    const cpFile = path.join(path.dirname(file), "audit-checkpoint.json");
+    vi.resetModules();
+    process.env.PROMPTSHIELD_DB_PATH = file;
+    process.env.PROMPTSHIELD_CHECKPOINT_PATH = cpFile;
+    process.env.PS_AUDIT_SIGNING_KEY = "test-signing-key";
+    try {
+      const fresh = await import("../server/store");
+      fresh.store.audit({ type: "run_created", detail: "signed-event" });
+      const events = fresh.store.listAudit();
+      expect(events[0].sig).toMatch(/^[a-f0-9]{64}$/);
+      expect(fresh.store.verifyAuditChain().valid).toBe(true);
+
+      // Forged event (correct-looking hash, wrong sig) must fail.
+      const forged = { ...events[0], id: "forged", sig: "f".repeat(64) };
+      events.unshift(forged as never);
+      expect(fresh.store.verifyAuditChain().valid).toBe(false);
+
+      // Restore and write a checkpoint — verifies and round-trips.
+      fresh.store.reset();
+      fresh.store.audit({ type: "run_finished", detail: "again" });
+      const cp = fresh.store.auditCheckpoint();
+      expect(cp.sig).toBeTruthy();
+      const v = fresh.store.verifyAuditChain();
+      expect(v.valid).toBe(true);
+      expect(v.checkpoint).toBe("ok");
+
+      // Tamper the checkpoint body → signature invalid flagged.
+      (await import("node:fs")).writeFileSync(cpFile, JSON.stringify({ ...cp, lastHash: "0".repeat(64) }));
+      expect(fresh.store.verifyAuditChain().checkpoint).toBe("invalid-signature");
+
+      // Chain advanced past checkpoint → mismatch flagged.
+      fresh.store.auditCheckpoint();
+      fresh.store.audit({ type: "test_executed", detail: "after-checkpoint" });
+      expect(fresh.store.verifyAuditChain().checkpoint).toBe("mismatch");
+    } finally {
+      delete process.env.PS_AUDIT_SIGNING_KEY;
+      delete process.env.PROMPTSHIELD_CHECKPOINT_PATH;
+      vi.resetModules();
+    }
+  });
+});

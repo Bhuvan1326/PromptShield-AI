@@ -179,7 +179,7 @@ export default function Firewall({ ctx: _ctx }: { ctx: AppContext }) {
                         <span className="text-foreground">{d.tool}</span>
                       </div>
                       <div className="text-muted">{d.reason}</div>
-                      <div className="text-muted/60">{d.id} · {d.correlationId}</div>
+                      <div className="text-muted/80">{d.id} · {d.correlationId}</div>
                     </div>
                   </div>
                 );

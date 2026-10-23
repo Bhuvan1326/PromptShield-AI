@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -46,6 +46,37 @@ const empty = (): Db => ({ runs: [], findings: [], audit: [], agentSessions: [],
 
 function dbPath(): string {
   return process.env.PROMPTSHIELD_DB_PATH || path.join(DEFAULT_DATA_DIR, "promptshield.json");
+}
+
+function checkpointPath(): string {
+  return process.env.PROMPTSHIELD_CHECKPOINT_PATH || path.join(DEFAULT_DATA_DIR, "audit-checkpoint.json");
+}
+
+// Optional audit signing — key lives in the environment (separate from the
+// database) so a rewrite of promptshield.json cannot forge signatures.
+const signKey = process.env.PS_AUDIT_SIGNING_KEY || undefined;
+
+function hmac(key: string, data: string): string {
+  return createHmac("sha256", key).update(data).digest("hex");
+}
+
+/** Compare stored checkpoint to the live chain tip + validate its signature. */
+function verifyCheckpoint(d: Db): "ok" | "unsigned" | "missing" | "mismatch" | "invalid-signature" {
+  const file = checkpointPath();
+  if (!existsSync(file)) return signKey ? "missing" : "unsigned";
+  try {
+    const cp = JSON.parse(readFileSync(file, "utf8")) as {
+      lastHash?: string; count?: number; sig?: string; at?: string;
+    };
+    if (signKey) {
+      const { sig, ...body } = cp;
+      if (!sig || sig !== hmac(signKey, JSON.stringify(body))) return "invalid-signature";
+    }
+    const tip = d.audit[0]?.hash ?? d.auditChainAnchor ?? "GENESIS";
+    return cp.lastHash === tip ? "ok" : "mismatch";
+  } catch {
+    return "invalid-signature";
+  }
 }
 
 let db: Db | null = null;
@@ -103,7 +134,18 @@ function load(): Db {
   return empty();
 }
 
+let batchDepth = 0;
+
 function persist() {
+  if (batchDepth > 0) return; // deferred — flushed by the outermost batch()
+  const file = dbPath();
+  mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + ".tmp";
+  writeFileSync(tmp, JSON.stringify(getDb(), null, 2), "utf8");
+  renameSync(tmp, file);
+}
+
+function persistNow() {
   const file = dbPath();
   mkdirSync(path.dirname(file), { recursive: true });
   const tmp = file + ".tmp";
@@ -118,6 +160,24 @@ export function id(prefix: string): string {
 export const store = {
   /** Coarse descriptor only — never expose the on-disk path via the API. */
   storageKind: "local-json-file",
+
+  /**
+   * Run `fn` with persistence deferred: all mutations inside write a single
+   * file at the end instead of one write per call. Durability is unchanged
+   * (the final state is flushed once, atomically); ordering of in-memory
+   * operations is preserved. Safe for synchronous critical sections only —
+   * do NOT yield/await inside (interleaved async writers could share the
+   * batch window). Supports nesting; only the outermost batch flushes.
+   */
+  batch<T>(fn: () => T): T {
+    batchDepth++;
+    try {
+      return fn();
+    } finally {
+      batchDepth--;
+      if (batchDepth === 0) persistNow();
+    }
+  },
 
   addRun(run: RunRecord) {
     const d = getDb();
@@ -159,28 +219,62 @@ export const store = {
     // audit[0] is the chronologically previous (newest) event — the new
     // event chains to it; when empty the anchor (or GENESIS) is the prev.
     const prevHash = d.audit[0]?.hash ?? d.auditChainAnchor;
-    d.audit.unshift({ ...base, hash: chainHash(prevHash, base) });
+    const hash = chainHash(prevHash, base);
+    // Optional integrity signature — PS_AUDIT_SIGNING_KEY lives in the
+    // environment, NOT in the database, so an attacker who can rewrite
+    // promptshield.json cannot produce valid signatures. unsigned legacy
+    // events remain verifiable by chain alone.
+    const sig = signKey ? hmac(signKey, hash) : undefined;
+    d.audit.unshift({ ...base, hash, ...(sig ? { sig } : {}) });
     if (d.audit.length > MAX_AUDIT_EVENTS) {
       // The dropped event's hash becomes the chain anchor — retained events
       // remain verifiable against it.
       d.auditChainAnchor = d.audit[MAX_AUDIT_EVENTS]?.hash ?? d.auditChainAnchor;
       d.audit.length = MAX_AUDIT_EVENTS;
     }
+    // Periodic checkpoint — a signed snapshot of the chain tip kept outside
+    // the mutable store file. Frequency bounded to limit write overhead.
+    if (signKey && d.audit.length % 50 === 0) this.auditCheckpoint();
     persist();
   },
-  verifyAuditChain(): { valid: boolean; checked: number; firstBadId?: string } {
+  verifyAuditChain(): { valid: boolean; checked: number; firstBadId?: string; checkpoint?: string } {
     // Events are stored newest-first; walk oldest→newest recomputing hashes.
     const d = getDb();
     const events = [...d.audit].reverse();
     let prev: string | undefined = d.auditChainAnchor;
     for (const e of events) {
       if (!e.hash) return { valid: false, checked: 0, firstBadId: e.id };
-      const { hash, ...body } = e;
+      const { hash, sig, ...body } = e as AuditEvent & { sig?: string };
       const expected = chainHash(prev, body as never);
       if (expected !== hash) return { valid: false, checked: 0, firstBadId: e.id };
+      // When signing is configured, any event lacking a valid sig is treated
+      // as integrity-suspect (an attacker can forge hashes but not HMACs).
+      if (signKey && (!sig || sig !== hmac(signKey, hash))) {
+        return { valid: false, checked: 0, firstBadId: e.id };
+      }
       prev = hash;
     }
-    return { valid: true, checked: events.length };
+    const checkpoint = verifyCheckpoint(d);
+    return { valid: true, checked: events.length, checkpoint };
+  },
+
+  /** Write a signed checkpoint separate from the mutable store file. */
+  auditCheckpoint(): { at: string; lastHash: string; count: number; sig?: string } {
+    const d = getDb();
+    const cp = {
+      at: new Date().toISOString(),
+      lastHash: d.audit[0]?.hash ?? d.auditChainAnchor ?? "GENESIS",
+      count: d.audit.length,
+    };
+    const sig = signKey ? hmac(signKey, JSON.stringify(cp)) : undefined;
+    const file = checkpointPath();
+    try {
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, JSON.stringify({ ...cp, sig }, null, 2), "utf8");
+    } catch {
+      // Checkpoint failure must not break the event path — surfaced on verify.
+    }
+    return { ...cp, sig };
   },
   listAudit() {
     return getDb().audit;

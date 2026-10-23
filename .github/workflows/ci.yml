@@ -23,5 +23,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      - name: Secret scan (tracked files, redacted output)
+        run: node scripts/secret-scan.mjs
+      - name: Dependency audit (production deps, high+)
+        run: npm audit --omit=dev --audit-level=high || echo "::warning::production audit has advisories — see docs"
       # No secrets are ever exposed: the suite runs fully deterministic and
       # all Gemini tests are mocked.

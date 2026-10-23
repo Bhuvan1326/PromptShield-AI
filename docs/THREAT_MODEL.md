@@ -14,7 +14,7 @@ application itself, not the simulated scenarios.
 
 | Boundary | Control |
 |---|---|
-| Client → API | zod schemas on every mutation; 200KB body limit; security headers/CSP; per-scope rate limits; `trust proxy` OFF (XFF not trusted); `PS_API_TOKEN` on mutations in deployed mode |
+| Client → API | zod schemas on every mutation; 200KB body limit; security headers/CSP; per-scope rate limits; `trust proxy` OFF; deployed auth: `x-api-token` header **or** HttpOnly SameSite=Strict session cookie (operator/admin roles); CSRF origin guard on cookie-authed mutations |
 | Route → agent | `runAgent` owns concurrency slots (single acquire/release); owner = `req.ip`; cap 3/owner; budgets enforced server-side; dedicated `agent` rate-limit scope |
 | Agent → fixtures | approved catalog only; no arbitrary code, network, or filesystem |
 | Model → pipeline | zod + allowlist validation; advisory only; abort timeouts; key never client-side |
@@ -28,7 +28,7 @@ application itself, not the simulated scenarios.
 - Firewall: deny-unknown, arg validation, approval-required, session guard, fail-closed — unit + API tested.
 - Redaction: canary value never serializes into findings/forensics/HTML — tested.
 - Audit chain: verifies (`/api/audit/verify`); tampering detected — tested.
-- Auth: `PS_API_TOKEN`/`PS_ADMIN_TOKEN` timing-safe compare, 401 without/with wrong token — verified live.
+- Auth: `PS_API_TOKEN`/`PS_ADMIN_TOKEN` timing-safe compare; SPA authenticates via `POST /api/session/login` → HttpOnly `ps_session` cookie (8h TTL, admin vs operator role); CSRF blocked for forged Origin/`sec-fetch-site`; logout invalidates; admin session required for `/api/reset` — all covered by 5 e2e tests.
 
 ## Known residual risks (unresolved)
 

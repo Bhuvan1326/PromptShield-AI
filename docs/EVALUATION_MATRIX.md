@@ -24,7 +24,7 @@ Legend: ✅ verified · ⚠️ partial/unverified · ❌ gap
 | Firewall enforcement | `evaluate()` used by defended engine + API console; deny/validate/approve/fail-closed tested |
 | Owner-slot lifecycle | exactly-once release across all exits — unit + live-tested |
 | Idempotency | atomic reserve/finalize/abandon — concurrent-duplicate tested |
-| Auth (deployed) | `PS_API_TOKEN`/`PS_ADMIN_TOKEN`, timing-safe, verified 401/200 live |
+| Auth (deployed) | `x-api-token` header OR HttpOnly SameSite=Strict session cookie (`POST /api/session/login`); CSRF origin guard; admin role for reset; timing-safe compares; 5 e2e tests (bad token, cookie auth, forged Origin/sec-fetch-site, forged/expired/logged-out session, admin-vs-operator) |
 | Redaction | canary never serializes — tested |
 | Audit integrity | SHA-256 chain, tamper detection tested, `/api/audit/verify` |
 | Validation/headers/limits | zod, CSP, per-scope rate limits — API-tested |

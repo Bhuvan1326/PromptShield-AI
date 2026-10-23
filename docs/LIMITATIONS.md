@@ -5,8 +5,11 @@
 - **Unresolved Critical**: a likely-real credential exists in commit `166dee4`
   reachable via local branch `backup-before-secret-cleanup`. Rotation and
   history purge are **user actions** — intentionally not performed by tooling.
-- Owner identity is `req.ip` — client-derived, not authenticated. Correct for
-  a single-trusted-user demo; not multi-tenant.
+- Owner identity for resource scoping (slots/idempotency/rate-limits) is
+  `req.ip` — separate from request auth (token/session gates mutations in
+  deployed mode). Fine for a single-trusted-user deployment; not multi-tenant.
+- Sessions are process-local (same single-instance limitation); they do not
+  persist across restarts — users must sign in again after a deploy/restart.
 - Slots, idempotency, and rate limits are **process-local**. Multi-instance
   deployment requires a shared atomic store (e.g. Redis `SET NX PX`) — designed
   for, not implemented.

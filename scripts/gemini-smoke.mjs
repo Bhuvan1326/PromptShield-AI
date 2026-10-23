@@ -15,6 +15,14 @@
 const key = process.env.GEMINI_API_KEY;
 const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
+if (process.env.PS_LIVE_GEMINI_SMOKE !== "1") {
+  console.log(
+    "RESULT: SKIPPED — opt-in required. This makes ONE real external call.\n" +
+      "  Run with: PS_LIVE_GEMINI_SMOKE=1 node scripts/gemini-smoke.mjs",
+  );
+  process.exit(0);
+}
+
 if (!key || !key.trim()) {
   console.log("RESULT: SKIPPED — GEMINI_API_KEY not configured (deterministic mode unaffected)");
   process.exit(0);

@@ -26,11 +26,14 @@ const typeColors: Record<string, string> = {
   investigation_failed: "text-warning",
 };
 
+const PAGE = 100;
+
 export default function Audit({ ctx }: { ctx: AppContext }) {
   const [events, setEvents] = useState<AuditEvent[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [shown, setShown] = useState(PAGE);
 
   const load = () => api.audit().then(setEvents).catch((e) => setError(e.message));
   useEffect(() => {
@@ -85,7 +88,7 @@ export default function Audit({ ctx }: { ctx: AppContext }) {
             subtitle="Newest first · capped at 500 entries"
           />
           <div className="divide-y divide-border/40">
-            {events.map((e) => (
+            {events.slice(0, shown).map((e) => (
               <div
                 key={e.id}
                 className="flex items-baseline gap-4 px-4 py-2 font-mono text-2xs hover:bg-card/40"
@@ -104,6 +107,13 @@ export default function Audit({ ctx }: { ctx: AppContext }) {
               </div>
             ))}
           </div>
+          {events.length > shown && (
+            <div className="border-t border-border px-4 py-2">
+              <Button variant="ghost" onClick={() => setShown((s) => s + PAGE)}>
+                Show more ({events.length - shown} remaining)
+              </Button>
+            </div>
+          )}
         </Card>
       )}
     </div>

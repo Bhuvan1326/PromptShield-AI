@@ -14,6 +14,16 @@ import { buildReport } from "./report";
 import { buildOverview } from "./stats";
 import { geminiStatus, GeminiUnavailable, investigate } from "./gemini";
 import { requireApiToken, safeTokenEqual } from "./auth";
+import { memoryCoordinator, redisCoordinator, type Coordinator } from "./coordination";
+import {
+  clearSessionCookie,
+  createSession,
+  destroySession,
+  ownerOf,
+  readSessionId,
+  sessionCookie,
+  sessionRole,
+} from "./session";
 import { analyzeRunWithGemini, planTestsWithGemini } from "./ai-eval";
 import {
   cancelSession,
@@ -23,12 +33,9 @@ import {
   PRESETS,
 } from "./agent/session";
 import {
-  abandonIdempotency,
-  finalizeIdempotency,
   IDEM_KEY_RE,
   idemScope,
   requestFingerprint,
-  reserveIdempotency,
 } from "./idempotency";
 import { buildAttackGraph } from "./graph";
 import { buildForensicRecord } from "./forensics";
@@ -125,6 +132,69 @@ const agentLimit = rateLimit({
   max: Number(process.env.PS_RL_AGENT_MAX) || 10,
   scope: "agent",
 });
+const authLimit = rateLimit({
+  windowMs: rlWindow(60_000),
+  max: Number(process.env.PS_RL_AUTH_MAX) || 10,
+  scope: "auth",
+});
+
+// Coordination backend for owner-slots + idempotency. PS_COORDINATION=redis
+// + PS_REDIS_URL selects the shared atomic store (multi-instance); anything
+// else uses the tested process-local memory impl. A requested-but-unreachable
+// Redis fails closed at startup rather than silently degrading.
+async function createCoordinator(): Promise<Coordinator> {
+  if (process.env.PS_COORDINATION === "redis") {
+    const url = process.env.PS_REDIS_URL;
+    if (!url) throw new Error("PS_COORDINATION=redis requires PS_REDIS_URL");
+    const { Redis } = await import("ioredis");
+    const client = new Redis(url, { maxRetriesPerRequest: 2, lazyConnect: true });
+    await client.connect();
+    console.log("[PromptShield] coordination backend: redis");
+    return redisCoordinator(client);
+  }
+  return memoryCoordinator();
+}
+const coordinator = await createCoordinator();
+
+// --- Operator sessions (cookie auth for the SPA; header-token remains for
+// API clients) -----------------------------------------------------------
+
+app.post("/api/session/login", authLimit, (req, res) => {
+  const parsed = z.object({ token: z.string().min(1).max(256) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "token required" });
+  const apiToken = process.env.PS_API_TOKEN;
+  if (!apiToken) {
+    return res.status(400).json({ error: "Session auth is not required in local mode." });
+  }
+  const supplied = parsed.data.token;
+  const adminToken = process.env.PS_ADMIN_TOKEN;
+  const isAdmin = Boolean(adminToken && safeTokenEqual(supplied, adminToken));
+  const isOperator = safeTokenEqual(supplied, apiToken);
+  if (!isAdmin && !isOperator) {
+    store.audit({ type: "auth_event", detail: "Session login rejected (invalid token)" });
+    return res.status(401).json({ error: "Invalid token." });
+  }
+  const sid = createSession(isAdmin ? "admin" : "operator");
+  const secure = req.secure || process.env.NODE_ENV === "production";
+  res.setHeader("Set-Cookie", sessionCookie(sid, secure));
+  store.audit({ type: "auth_event", detail: `Session login (${isAdmin ? "admin" : "operator"})` });
+  res.json({ authenticated: true, role: isAdmin ? "admin" : "operator" });
+});
+
+app.post("/api/session/logout", (req, res) => {
+  destroySession(readSessionId(req));
+  res.setHeader("Set-Cookie", clearSessionCookie);
+  res.json({ authenticated: false });
+});
+
+app.get("/api/session", (req, res) => {
+  const role = sessionRole(req);
+  res.json({
+    authenticated: Boolean(role),
+    role,
+    mode: process.env.PS_API_TOKEN ? "deployed" : "local",
+  });
+});
 
 const PORT = Number(process.env.PORT) || 8787;
 const PROJECT_ID = "demo-project";
@@ -150,8 +220,9 @@ function resolveSuiteTests(suiteId: string): string[] | null {
 
 /** Execute a suite or single test, persist the run + findings + audit events. */
 function runHarness(environment: Environment, testIds: string[], suiteLabel: string): RunRecord {
-  const startedAt = new Date();
-  store.audit({
+  return store.batch(() => {
+    const startedAt = new Date();
+    store.audit({
     type: "run_created",
     environment,
     detail: `Run started on '${environment}' · suite '${suiteLabel}' · ${testIds.length} test(s)`,
@@ -185,9 +256,8 @@ function runHarness(environment: Environment, testIds: string[], suiteLabel: str
       unknownTestIds: scored.unknownTestIds.length,
     }),
   };
-  store.addRun(run);
-
   const findings = findingsFromRun(run, results);
+  store.addRun(run);
   if (findings.length) store.addFindings(findings);
   for (const f of findings) {
     store.audit({
@@ -208,6 +278,7 @@ function runHarness(environment: Environment, testIds: string[], suiteLabel: str
       `${run.metrics.inconclusive} inconclusive, ${run.metrics.errors} error`,
   });
   return run;
+  });
 }
 
 // --- Routes ----------------------------------------------------------------
@@ -221,6 +292,10 @@ app.get("/api/health/status", (_req, res) => {
       message: g.message,
     },
     storage: { state: "ready", kind: store.storageKind },
+    auth: {
+      mode: process.env.PS_API_TOKEN ? "deployed" : "local",
+      sessionEnabled: true,
+    },
     engine: { state: "ready", testCases: TEST_CASES.length },
   });
 });
@@ -448,7 +523,7 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
   if (!parsed.success) {
     return res.status(400).json({ error: "Provide environment and preset (quick|standard|deep)" });
   }
-  const owner = req.ip ?? "unknown";
+  const owner = ownerOf(req);
   const { environment, preset } = parsed.data;
 
   // --- Idempotency-Key (optional, process-local) ---
@@ -463,31 +538,43 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
     }
     const fingerprint = requestFingerprint(parsed.data);
     scopeKey = idemScope(owner, "agent_sessions", idemHeader);
-    const reserved = reserveIdempotency(scopeKey, fingerprint, sessionId);
-    if (reserved.kind === "conflict") {
+    let reserved;
+    try {
+      reserved = await coordinator.reserveIdem({ scopeKey, fingerprint, sessionId, ttlMs: 60_000 });
+    } catch {
+      // Coordination backend unavailable → fail closed, no session created.
+      return res.status(503).json({ error: "Coordination backend unavailable." });
+    }
+    if (reserved.state === "conflict") {
       return res.status(409).json({ error: "Idempotency-Key was already used with a different request." });
     }
-    if (reserved.kind === "replay") {
-      const existingSession = store.getAgentSession(reserved.sessionId);
+    if (reserved.state === "replay" || reserved.state === "in-flight") {
+      const existingSession = reserved.sessionId
+        ? store.getAgentSession(reserved.sessionId)
+        : undefined;
       if (existingSession) {
         // Replay — no new session, no slot, no duplicate audit event.
         return res.status(200).set("Idempotency-Replayed", "true").json(existingSession);
       }
       // In-flight sibling hasn't persisted yet, or its record was trimmed:
       // return the id so the client can poll the same session.
-      return res
-        .status(202)
-        .set("Idempotency-Replayed", "true")
-        .json({ id: reserved.sessionId, status: "running" });
+      if (reserved.sessionId) {
+        return res
+          .status(202)
+          .set("Idempotency-Replayed", "true")
+          .json({ id: reserved.sessionId, status: "running" });
+      }
+      // Reserved sibling didn't report an id — ask the client to retry.
+      return res.status(409).json({ error: "Duplicate request in progress." });
     }
-    // "reserved" — we own the slot; finalize on success, abandon on failure.
+    // "fresh" — we own the slot; finalize on success, abandon on failure.
   }
 
   // Read-only precheck only — runAgent is the sole owner of slot
   // acquire/release; a race past this check surfaces as an honest
   // 'concurrency_limit' session error, never a leaked slot.
   if (ownerActiveCount(owner) >= MAX_CONCURRENT_PER_OWNER) {
-    if (scopeKey) abandonIdempotency(scopeKey);
+    if (scopeKey) await coordinator.abandonIdem(scopeKey).catch(() => {});
     return res.status(429).json({ error: "Concurrent session limit reached for this client." });
   }
 
@@ -512,17 +599,19 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
   };
   // Persist BEFORE launching so the first onStep update has a row to hit.
   try {
-    store.addAgentSession(session);
+    store.batch(() => {
+      store.addAgentSession(session);
+      store.audit({
+        type: "agent_session",
+        environment,
+        detail: `Agent session ${sessionId} started (${PRESETS[preset].label})`,
+      });
+    });
   } catch {
-    if (scopeKey) abandonIdempotency(scopeKey);
+    if (scopeKey) await coordinator.abandonIdem(scopeKey).catch(() => {});
     return res.status(500).json({ error: "Failed to create agent session" });
   }
-  if (scopeKey) finalizeIdempotency(scopeKey);
-  store.audit({
-    type: "agent_session",
-    environment,
-    detail: `Agent session ${sessionId} started (${PRESETS[preset].label})`,
-  });
+  if (scopeKey) await coordinator.finalizeIdem(scopeKey).catch(() => {});
 
   // Run asynchronously — the client polls for progress. Pacing is simulated
   // for observability; every step executes the real deterministic engine.
@@ -531,6 +620,7 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
     environment,
     preset,
     owner,
+    coordinator,
     onStep: (s) => {
       store.updateAgentSession(s.id, {
         phase: s.phase,
@@ -570,22 +660,24 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
       metrics: computeMetrics(scored.results, { unknownTestIds: scored.unknownTestIds.length }),
       agentSessionId: session.id,
     };
-    store.addRun(run);
     const fs = findingsFromRun(run, results);
-    if (fs.length) store.addFindings(fs);
-    store.updateAgentSession(session.id, {
-      runId: run.id,
-      findings: fs.map((f) => f.id),
-      status: session.status,
-      stopReason: session.stopReason,
-      trace: session.trace,
-      budget: session.budget,
-    });
-    store.audit({
-      type: "agent_session",
-      environment,
-      runId: run.id,
-      detail: `Agent session ${session.id} ${session.status}: ${session.stopReason} — ${session.budget.stepsUsed} steps, ${session.successfulTestIds.length} verified success(es)`,
+    store.batch(() => {
+      store.addRun(run);
+      if (fs.length) store.addFindings(fs);
+      store.updateAgentSession(session.id, {
+        runId: run.id,
+        findings: fs.map((f) => f.id),
+        status: session.status,
+        stopReason: session.stopReason,
+        trace: session.trace,
+        budget: session.budget,
+      });
+      store.audit({
+        type: "agent_session",
+        environment,
+        runId: run.id,
+        detail: `Agent session ${session.id} ${session.status}: ${session.stopReason} — ${session.budget.stepsUsed} steps, ${session.successfulTestIds.length} verified success(es)`,
+      });
     });
   }).catch((err) => {
     store.updateAgentSession(sessionId, {
@@ -615,6 +707,10 @@ app.post("/api/agent/sessions/:id/cancel", requireApiToken, (req, res) => {
     return res.status(409).json({ error: `Session is ${s.status}, not running` });
   }
   cancelSession(s.id);
+  // Persist the cancellation intent — the in-memory flag is process-local,
+  // but the recorded intent survives into the audit trail and the session
+  // row for observability.
+  store.updateAgentSession(s.id, { stopReason: "cancel_requested" });
   store.audit({ type: "agent_session", detail: `Agent session ${s.id} cancel requested` });
   res.json({ ok: true });
 });
@@ -631,8 +727,10 @@ app.get("/api/runs/:id/graph", (req, res) => {
 // --- Defense effectiveness lab ------------------------------------------------
 
 app.get("/api/defense-lab/compare", (req, res) => {
-  const a = store.getRun(String(req.query.a));
-  const b = store.getRun(String(req.query.b));
+  const q = z.object({ a: z.string().min(1).max(64), b: z.string().min(1).max(64) }).safeParse(req.query);
+  if (!q.success) return res.status(400).json({ error: "Both runs 'a' and 'b' are required" });
+  const a = store.getRun(q.data.a);
+  const b = store.getRun(q.data.b);
   if (!a || !b) return res.status(404).json({ error: "Both runs 'a' and 'b' are required" });
   const testMap = new Map(TEST_CASES.map((t) => [t.id, t]));
   const resB = new Map(b.results.map((r) => [r.testId, r]));
@@ -677,7 +775,15 @@ app.get("/api/findings/:id/forensics", (req, res) => {
 });
 
 app.get("/api/audit/verify", (_req, res) => {
-  res.json(store.verifyAuditChain());
+  const result = store.verifyAuditChain();
+  // Refresh the signed checkpoint so future verifications compare against
+  // a state sealed *separate* from the mutable store file.
+  const refreshed = store.auditCheckpoint();
+  res.json({
+    ...result,
+    checkpoint: result.checkpoint,
+    signed: Boolean(refreshed.sig),
+  });
 });
 
 // --- Runtime firewall ------------------------------------------------------------
@@ -794,8 +900,10 @@ app.post("/api/benchmarks/run", runsLimit, requireApiToken, (req, res) => {
 });
 
 app.get("/api/benchmarks/compare", (req, res) => {
-  const a = store.getBenchmarkRun(String(req.query.a));
-  const b = store.getBenchmarkRun(String(req.query.b));
+  const q = z.object({ a: z.string().min(1).max(64), b: z.string().min(1).max(64) }).safeParse(req.query);
+  if (!q.success) return res.status(400).json({ error: "Both benchmark ids 'a' and 'b' are required" });
+  const a = store.getBenchmarkRun(q.data.a);
+  const b = store.getBenchmarkRun(q.data.b);
   if (!a || !b) return res.status(404).json({ error: "Both benchmark ids 'a' and 'b' are required" });
   res.json({
     a,
@@ -872,10 +980,10 @@ function requireResetAuthorization(
   const adminToken = process.env.PS_ADMIN_TOKEN;
   if (adminToken) {
     const supplied = req.get("x-admin-token") ?? "";
-    if (!supplied || !safeTokenEqual(supplied, adminToken)) {
-      return res.status(403).json({ error: "Reset requires a valid admin token." });
-    }
-    return next();
+    if (supplied && safeTokenEqual(supplied, adminToken)) return next();
+    // Admin-session cookie path (SPA) — same origin guard via requireApiToken.
+    if (sessionRole(req) === "admin") return next();
+    return res.status(403).json({ error: "Reset requires a valid admin token." });
   }
   if (!LOOPBACK.has(req.ip ?? "")) {
     return res.status(403).json({ error: "Reset is restricted to local clients." });

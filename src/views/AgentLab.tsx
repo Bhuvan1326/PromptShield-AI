@@ -32,7 +32,10 @@ export default function AgentLab({ ctx }: { ctx: AppContext }) {
   const poll = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    api.agentSessions().then(setSessions).catch(() => {});
+    api
+      .agentSessions()
+      .then(setSessions)
+      .catch((e) => setError(e instanceof Error ? e.message : "Failed to load sessions"));
     return () => { if (poll.current) clearInterval(poll.current); };
   }, []);
 

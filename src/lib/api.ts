@@ -15,6 +15,7 @@ import type {
   RunMetrics,
   RunRecord,
   SecurityReport,
+  SessionStatus,
   SuiteDefinition,
   TestCase,
   Verdict,
@@ -211,4 +212,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ confirm: "RESET" }),
     }),
+  session: () => request<SessionStatus>("/api/session"),
+  login: (token: string) =>
+    request<SessionStatus>("/api/session/login", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    }),
+  logout: () => request<{ authenticated: false }>("/api/session/logout", { method: "POST" }),
 };

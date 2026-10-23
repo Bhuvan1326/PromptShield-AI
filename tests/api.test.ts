@@ -253,6 +253,120 @@ describe("API token authentication (PS_API_TOKEN)", () => {
   });
 });
 
+describe("operator cookie sessions", () => {
+  async function login(token: string) {
+    const r = await request(app).post("/api/session/login").send({ token });
+    const cookie = (r.headers["set-cookie"] ?? [])[0];
+    return { res: r, cookie };
+  }
+
+  it("login rejects bad tokens; issues an HttpOnly SameSite=Strict cookie on success", async () => {
+    process.env.PS_API_TOKEN = "deploy-token-123";
+    try {
+      const bad = await login("wrong-token");
+      expect(bad.res.status).toBe(401);
+
+      const good = await login("deploy-token-123");
+      expect(good.res.status).toBe(200);
+      expect(good.res.body).toMatchObject({ authenticated: true, role: "operator" });
+      expect(good.cookie).toMatch(/ps_session=/);
+      expect(good.cookie).toMatch(/HttpOnly/);
+      expect(good.cookie).toMatch(/SameSite=Strict/);
+    } finally {
+      delete process.env.PS_API_TOKEN;
+    }
+  });
+
+  it("cookie-authenticated mutations pass; cross-origin requests are CSRF-blocked", async () => {
+    process.env.PS_API_TOKEN = "deploy-token-123";
+    try {
+      const { cookie } = await login("deploy-token-123");
+
+      const ok = await request(app)
+        .post("/api/runs")
+        .set("Cookie", cookie)
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(ok.status).toBe(200);
+
+      // Forged cross-site request — Origin mismatches Host → 403.
+      const forged = await request(app)
+        .post("/api/runs")
+        .set("Cookie", cookie)
+        .set("Origin", "https://evil.example.com")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(forged.status).toBe(403);
+
+      // Explicit cross-site fetch metadata → 403.
+      const forged2 = await request(app)
+        .post("/api/runs")
+        .set("Cookie", cookie)
+        .set("sec-fetch-site", "cross-site")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(forged2.status).toBe(403);
+
+      // Header-token auth is NOT ambient → Origin doesn't matter.
+      const headerAuth = await request(app)
+        .post("/api/runs")
+        .set("x-api-token", "deploy-token-123")
+        .set("Origin", "https://anything.example.com")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(headerAuth.status).toBe(200);
+    } finally {
+      delete process.env.PS_API_TOKEN;
+    }
+  });
+
+  it("forged cookie, expired session, and logout all fail closed", async () => {
+    process.env.PS_API_TOKEN = "deploy-token-123";
+    try {
+      const forged = await request(app)
+        .post("/api/runs")
+        .set("Cookie", "ps_session=forged-id")
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(forged.status).toBe(401);
+
+      const { cookie } = await login("deploy-token-123");
+      const out = await request(app).post("/api/session/logout").set("Cookie", cookie);
+      expect(out.status).toBe(200);
+      const after = await request(app)
+        .post("/api/runs")
+        .set("Cookie", cookie)
+        .send({ environment: "baseline", testId: "PS-BEN-01" });
+      expect(after.status).toBe(401);
+    } finally {
+      delete process.env.PS_API_TOKEN;
+    }
+  });
+
+  it("admin session can reset; operator session cannot", async () => {
+    process.env.PS_API_TOKEN = "deploy-token-123";
+    process.env.PS_ADMIN_TOKEN = "test-admin-token";
+    try {
+      const { cookie: opCookie } = await login("deploy-token-123");
+      const denied = await request(app)
+        .post("/api/reset")
+        .set("Cookie", opCookie)
+        .send({ confirm: "RESET" });
+      expect(denied.status).toBe(403);
+
+      const { cookie: adminCookie } = await login("test-admin-token");
+      const allowed = await request(app)
+        .post("/api/reset")
+        .set("Cookie", adminCookie)
+        .send({ confirm: "RESET" });
+      expect(allowed.status).toBe(200);
+    } finally {
+      delete process.env.PS_API_TOKEN;
+      delete process.env.PS_ADMIN_TOKEN;
+    }
+  });
+
+  it("local mode (no PS_API_TOKEN) does not issue sessions", async () => {
+    const r = await request(app).post("/api/session/login").send({ token: "x" });
+    expect(r.status).toBe(400);
+  });
+});
+
 describe("rate limiting", () => {
   it("rate-limits finding reruns (429 under burst)", async () => {
     await request(app).post("/api/runs").send({ environment: "baseline", suiteId: "full" });

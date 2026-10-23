@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type express from "express";
+import { csrfOriginOk, sessionRole } from "./session";
 
 /**
  * Constant-time token comparison that also tolerates unequal-length inputs:
@@ -36,8 +37,14 @@ export function requireApiToken(
   const expected = process.env.PS_API_TOKEN;
   if (!expected) return next(); // local demo mode
   const supplied = req.get("x-api-token") ?? "";
-  if (!supplied || !safeTokenEqual(supplied, expected)) {
-    return res.status(401).json({ error: "Authentication required." });
+  if (supplied && safeTokenEqual(supplied, expected)) return next();
+  // Cookie-session path (SPA): ambient credentials need an origin guard.
+  const role = sessionRole(req);
+  if (role) {
+    if (!csrfOriginOk(req)) {
+      return res.status(403).json({ error: "Cross-origin mutation rejected." });
+    }
+    return next();
   }
-  next();
+  return res.status(401).json({ error: "Authentication required." });
 }

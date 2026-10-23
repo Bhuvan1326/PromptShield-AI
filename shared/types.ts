@@ -143,7 +143,8 @@ export type AuditEventType =
   | "ai_plan"
   | "agent_session"
   | "firewall_decision"
-  | "benchmark_run";
+  | "benchmark_run"
+  | "auth_event";
 
 export interface SuggestedTest {
   title: string;
@@ -350,6 +351,8 @@ export interface AuditEvent {
   detail: string;
   /** Tamper-evidence hash chaining this event to the previous one. */
   hash?: string;
+  /** HMAC-SHA256 signature over `hash` (present when PS_AUDIT_SIGNING_KEY set). */
+  sig?: string;
 }
 
 export interface OverviewStats {
@@ -420,6 +423,13 @@ export interface IntegrationStatus {
   };
   storage: { state: "ready" | "error"; kind: string };
   engine: { state: "ready"; testCases: number };
+  auth: { mode: "local" | "deployed"; sessionEnabled: boolean };
+}
+
+export interface SessionStatus {
+  authenticated: boolean;
+  role: "operator" | "admin" | null;
+  mode: "local" | "deployed";
 }
 
 export interface InvestigationResponse {
