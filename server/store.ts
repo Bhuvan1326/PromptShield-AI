@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
@@ -38,6 +38,8 @@ interface Db {
   audit: AuditEvent[];
   /** Hash of the oldest dropped audit event — chain anchor after trimming. */
   auditChainAnchor?: string;
+  /** Monotonic event sequence — checkpoints compare seq to detect rollback. */
+  auditSeq?: number;
   agentSessions: AgentSession[];
   benchmarkRuns: BenchmarkRun[];
 }
@@ -52,31 +54,84 @@ function checkpointPath(): string {
   return process.env.PROMPTSHIELD_CHECKPOINT_PATH || path.join(DEFAULT_DATA_DIR, "audit-checkpoint.json");
 }
 
-// Optional audit signing — key lives in the environment (separate from the
-// database) so a rewrite of promptshield.json cannot forge signatures.
-const signKey = process.env.PS_AUDIT_SIGNING_KEY || undefined;
+// Audit signing — keys live in the environment (separate from the database)
+// so a rewrite of promptshield.json cannot forge signatures. Rotation:
+// PS_AUDIT_SIGNING_KEYS is a JSON map {kid: secret}; PS_AUDIT_SIGNING_KEY is
+// the legacy single-key form (kid="default"); PS_AUDIT_SIGNING_KID selects
+// the signing kid (defaults to the first configured key). Verification looks
+// each event's kid up in the trusted key map — attacker-supplied kid strings
+// resolve to nothing.
+function signingKeys(): Map<string, string> | null {
+  try {
+    if (process.env.PS_AUDIT_SIGNING_KEYS) {
+      const m = new Map<string, string>(Object.entries(JSON.parse(process.env.PS_AUDIT_SIGNING_KEYS)));
+      return m.size ? m : null;
+    }
+  } catch {
+    return null; // malformed key config → CONFIGURATION_FAILURE at verify
+  }
+  const single = process.env.PS_AUDIT_SIGNING_KEY;
+  return single ? new Map([["default", single]]) : null;
+}
+const signKeys = signingKeys();
+const signKid =
+  process.env.PS_AUDIT_SIGNING_KID ?? (signKeys ? [...signKeys.keys()][0] : undefined);
+const signKey = signKid && signKeys ? signKeys.get(signKid) : undefined;
 
 function hmac(key: string, data: string): string {
   return createHmac("sha256", key).update(data).digest("hex");
 }
 
-/** Compare stored checkpoint to the live chain tip + validate its signature. */
-function verifyCheckpoint(d: Db): "ok" | "unsigned" | "missing" | "mismatch" | "invalid-signature" {
+/** Format: `v1:<kid>:<hex-mac>` — algorithm + key id explicit; no downgrade. */
+function signEvent(kid: string, key: string, hash: string): string {
+  return `v1:${kid}:${hmac(key, "PSAUDITv1:" + hash)}`;
+}
+
+function verifyEventSig(sig: string, hash: string): "ok" | "bad-format" | "unknown-kid" | "bad-mac" {
+  const m = /^v1:([A-Za-z0-9_-]+):([0-9a-f]{64})$/.exec(sig);
+  if (!m) return "bad-format";
+  const [, kid, mac] = m;
+  const key = signKeys?.get(kid);
+  if (!key) return "unknown-kid";
+  const expected = signEvent(kid, key, hash).split(":")[2]!;
+  const a = Buffer.from(mac, "hex"), b = Buffer.from(expected, "hex");
+  return a.length === b.length && timingSafeEqual(a, b) ? "ok" : "bad-mac";
+}
+
+/**
+ * Compare stored checkpoint to the live chain tip + validate its signature.
+ * A checkpoint is a signed commitment to the chain tip AT a sequence number —
+ * "ok" means tip+seq match; "behind" means valid checkpoint for an earlier
+ * tail (unanchored recent events); everything else is a failure class.
+ */
+function verifyCheckpoint(d: Db):
+  "ok" | "behind" | "unsigned" | "missing" | "mismatch" | "invalid-signature" {
   const file = checkpointPath();
   if (!existsSync(file)) return signKey ? "missing" : "unsigned";
   try {
     const cp = JSON.parse(readFileSync(file, "utf8")) as {
-      lastHash?: string; count?: number; sig?: string; at?: string;
+      lastHash?: string; seq?: number; count?: number; sig?: string; at?: string;
     };
     if (signKey) {
       const { sig, ...body } = cp;
-      if (!sig || sig !== hmac(signKey, JSON.stringify(body))) return "invalid-signature";
+      if (!sig || !sig.toString().startsWith("v1:")) return "invalid-signature";
+      const bodyStr = JSON.stringify(body);
+      const expected = checkpointSig(bodyStr);
+      if (!expected || expected !== sig) return "invalid-signature";
     }
     const tip = d.audit[0]?.hash ?? d.auditChainAnchor ?? "GENESIS";
-    return cp.lastHash === tip ? "ok" : "mismatch";
+    if (cp.lastHash === tip && (cp.seq === undefined || cp.seq === (d.auditSeq ?? d.audit.length))) return "ok";
+    // Checkpoint validly signed but for an earlier tip → unanchored tail.
+    if (d.audit.some((e) => e.hash === cp.lastHash)) return "behind";
+    return "mismatch";
   } catch {
     return "invalid-signature";
   }
+}
+
+function checkpointSig(bodyStr: string): string | null {
+  if (!signKey || !signKid) return null;
+  return `v1:${signKid}:${hmac(signKey, "PSCHECKPOINTv1:" + bodyStr)}`;
 }
 
 let db: Db | null = null;
@@ -98,6 +153,7 @@ function load(): Db {
         agentSessions: Array.isArray(parsed.agentSessions) ? parsed.agentSessions : [],
         benchmarkRuns: Array.isArray(parsed.benchmarkRuns) ? parsed.benchmarkRuns : [],
         auditChainAnchor: typeof parsed.auditChainAnchor === "string" ? parsed.auditChainAnchor : undefined,
+        auditSeq: typeof parsed.auditSeq === "number" ? parsed.auditSeq : (Array.isArray(parsed.audit) ? parsed.audit.length : 0),
       };
       // Stale-session recovery: agent lifecycles are in-memory, so a session
       // persisted as "running" can never resume after a process restart.
@@ -215,16 +271,13 @@ export const store = {
 
   audit(event: Omit<AuditEvent, "id" | "at" | "hash"> & { type: AuditEventType }) {
     const d = getDb();
-    const base = { ...event, id: id("evt"), at: new Date().toISOString() };
+    d.auditSeq = (d.auditSeq ?? 0) + 1;
+    const base = { ...event, id: id("evt"), at: new Date().toISOString(), seq: d.auditSeq };
     // audit[0] is the chronologically previous (newest) event — the new
     // event chains to it; when empty the anchor (or GENESIS) is the prev.
     const prevHash = d.audit[0]?.hash ?? d.auditChainAnchor;
     const hash = chainHash(prevHash, base);
-    // Optional integrity signature — PS_AUDIT_SIGNING_KEY lives in the
-    // environment, NOT in the database, so an attacker who can rewrite
-    // promptshield.json cannot produce valid signatures. unsigned legacy
-    // events remain verifiable by chain alone.
-    const sig = signKey ? hmac(signKey, hash) : undefined;
+    const sig = signKey && signKid ? signEvent(signKid, signKey, hash) : undefined;
     d.audit.unshift({ ...base, hash, ...(sig ? { sig } : {}) });
     if (d.audit.length > MAX_AUDIT_EVENTS) {
       // The dropped event's hash becomes the chain anchor — retained events
@@ -237,7 +290,14 @@ export const store = {
     if (signKey && d.audit.length % 50 === 0) this.auditCheckpoint();
     persist();
   },
-  verifyAuditChain(): { valid: boolean; checked: number; firstBadId?: string; checkpoint?: string } {
+  verifyAuditChain(): {
+    valid: boolean;
+    checked: number;
+    firstBadId?: string;
+    checkpoint?: string;
+    status?: "VERIFIED" | "VERIFIED_WITH_UNANCHORED_TAIL" | "INTEGRITY_FAILURE" | "ANCHOR_UNAVAILABLE" | "CONFIGURATION_FAILURE";
+    sigError?: string;
+  } {
     // Events are stored newest-first; walk oldest→newest recomputing hashes.
     const d = getDb();
     const events = [...d.audit].reverse();
@@ -246,30 +306,52 @@ export const store = {
       if (!e.hash) return { valid: false, checked: 0, firstBadId: e.id };
       const { hash, sig, ...body } = e as AuditEvent & { sig?: string };
       const expected = chainHash(prev, body as never);
-      if (expected !== hash) return { valid: false, checked: 0, firstBadId: e.id };
-      // When signing is configured, any event lacking a valid sig is treated
-      // as integrity-suspect (an attacker can forge hashes but not HMACs).
-      if (signKey && (!sig || sig !== hmac(signKey, hash))) {
-        return { valid: false, checked: 0, firstBadId: e.id };
+      if (expected !== hash) {
+        return { valid: false, checked: 0, firstBadId: e.id, status: "INTEGRITY_FAILURE" as const };
+      }
+      // A signed event is only valid when its kid resolves in the trusted
+      // key map AND the MAC matches — unsigned events are chain-verifiable
+      // only (pre-signing history stays honest about its assurance level).
+      if (sig) {
+        const v = verifyEventSig(sig, hash);
+        if (v !== "ok") {
+          return { valid: false, checked: 0, firstBadId: e.id, status: "INTEGRITY_FAILURE" as const, sigError: v };
+        }
       }
       prev = hash;
     }
     const checkpoint = verifyCheckpoint(d);
-    return { valid: true, checked: events.length, checkpoint };
+    const status =
+      !signKeys && events.some((e) => e.sig) ? ("CONFIGURATION_FAILURE" as const)
+      : checkpoint === "missing" ? ("ANCHOR_UNAVAILABLE" as const)
+      : checkpoint === "mismatch" || checkpoint === "invalid-signature" ? ("INTEGRITY_FAILURE" as const)
+      : checkpoint === "ok" ? ("VERIFIED" as const)
+      : ("VERIFIED_WITH_UNANCHORED_TAIL" as const);
+    return { valid: true, checked: events.length, checkpoint, status };
   },
 
-  /** Write a signed checkpoint separate from the mutable store file. */
-  auditCheckpoint(): { at: string; lastHash: string; count: number; sig?: string } {
+  /**
+   * Write a signed checkpoint (seq + chain-tip commitment) separate from the
+   * mutable store file. Serialized with a compare-and-write guard: a stale
+   * checkpoint (lower seq) never overwrites a newer one within this process.
+   * Cross-instance CAS requires external anchoring — documented limitation.
+   */
+  auditCheckpoint(): { at: string; lastHash: string; seq: number; sig?: string } {
     const d = getDb();
     const cp = {
       at: new Date().toISOString(),
       lastHash: d.audit[0]?.hash ?? d.auditChainAnchor ?? "GENESIS",
-      count: d.audit.length,
+      seq: d.auditSeq ?? d.audit.length,
     };
-    const sig = signKey ? hmac(signKey, JSON.stringify(cp)) : undefined;
+    const sig = checkpointSig(JSON.stringify(cp)) ?? undefined;
     const file = checkpointPath();
     try {
       mkdirSync(path.dirname(file), { recursive: true });
+      // CAS: never overwrite a newer-or-equal checkpoint with an older seq.
+      if (existsSync(file)) {
+        const cur = JSON.parse(readFileSync(file, "utf8")) as { seq?: number };
+        if (typeof cur.seq === "number" && cur.seq > cp.seq) return { ...cp, sig };
+      }
       writeFileSync(file, JSON.stringify({ ...cp, sig }, null, 2), "utf8");
     } catch {
       // Checkpoint failure must not break the event path — surfaced on verify.

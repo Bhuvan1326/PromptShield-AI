@@ -432,11 +432,11 @@ describe("audit integrity — signing + checkpoints", () => {
       const fresh = await import("../server/store");
       fresh.store.audit({ type: "run_created", detail: "signed-event" });
       const events = fresh.store.listAudit();
-      expect(events[0].sig).toMatch(/^[a-f0-9]{64}$/);
+      expect(events[0].sig).toMatch(/^v1:default:[a-f0-9]{64}$/);
       expect(fresh.store.verifyAuditChain().valid).toBe(true);
 
       // Forged event (correct-looking hash, wrong sig) must fail.
-      const forged = { ...events[0], id: "forged", sig: "f".repeat(64) };
+      const forged = { ...events[0], id: "forged", sig: `v1:default:${"f".repeat(64)}` };
       events.unshift(forged as never);
       expect(fresh.store.verifyAuditChain().valid).toBe(false);
 
@@ -453,14 +453,53 @@ describe("audit integrity — signing + checkpoints", () => {
       (await import("node:fs")).writeFileSync(cpFile, JSON.stringify({ ...cp, lastHash: "0".repeat(64) }));
       expect(fresh.store.verifyAuditChain().checkpoint).toBe("invalid-signature");
 
-      // Chain advanced past checkpoint → mismatch flagged.
+      // Chain advanced past checkpoint → 'behind' (valid anchor, unanchored tail).
       fresh.store.auditCheckpoint();
       fresh.store.audit({ type: "test_executed", detail: "after-checkpoint" });
-      expect(fresh.store.verifyAuditChain().checkpoint).toBe("mismatch");
+      const tail = fresh.store.verifyAuditChain();
+      expect(tail.checkpoint).toBe("behind");
+      expect(tail.status).toBe("VERIFIED_WITH_UNANCHORED_TAIL");
     } finally {
       delete process.env.PS_AUDIT_SIGNING_KEY;
       delete process.env.PROMPTSHIELD_CHECKPOINT_PATH;
       vi.resetModules();
     }
+  });
+});
+
+describe("coordinator — lease semaphore (memory impl)", () => {
+  it("cap enforced; expired lease frees a slot; stale release can't drop a newer lease", async () => {
+    const { memoryCoordinator } = await import("../server/coordination");
+    const c = memoryCoordinator();
+    // Three leases max.
+    const l1 = await c.acquireSlot("o", 60_000);
+    const l2 = await c.acquireSlot("o", 60_000);
+    const l3 = await c.acquireSlot("o", 60_000);
+    expect([l1, l2, l3].every(Boolean)).toBe(true);
+    expect(await c.acquireSlot("o", 60_000)).toBeNull();
+
+    // Expired lease (ttl=1ms) frees the slot automatically.
+    const short = memoryCoordinator();
+    const s1 = await short.acquireSlot("o", 1);
+    expect(s1).toBeTruthy();
+    await new Promise((r) => setTimeout(r, 5));
+    // A fresh acquire should succeed — the expired lease is pruned.
+    expect(await short.acquireSlot("o", 60_000)).toBeTruthy();
+
+    // Stale release: s1's member no longer exists → release is a safe no-op
+    // and cannot remove s2.
+    const s2 = await short.acquireSlot("o", 60_000);
+    await short.releaseSlot("o", s1!);
+    expect(await short.leaseValid("o", s2!)).toBe(true);
+
+    // Lease validity: expired member → false.
+    expect(await short.leaseValid("o", s1!)).toBe(false);
+
+    // Duplicate release of a valid lease — first removes, second is no-op.
+    await c.releaseSlot("o", l1!);
+    await c.releaseSlot("o", l1!);
+    expect(await c.leaseValid("o", l1!)).toBe(false);
+    // Freed slot is reusable.
+    expect(await c.acquireSlot("o", 60_000)).toBeTruthy();
   });
 });

@@ -18,10 +18,7 @@
  * live multi-instance deployment in this environment.
  */
 import type Redis from "ioredis";
-import {
-  acquireOwnerSlot,
-  releaseOwnerSlot,
-} from "./agent/session";
+import { randomUUID } from "node:crypto";
 import {
   abandonIdempotency,
   finalizeIdempotency,
@@ -34,10 +31,27 @@ export interface IdemReserveResult {
   scopeKey?: string;
 }
 
+/**
+ * A slot lease — unique, unguessable member identifying one holder.
+ * `member` encodes leaseId:deadline so release/validity checks are exact-match
+ * (a stale worker can never release or extend a newer worker's slot).
+ */
+export interface SlotLease {
+  id: string;
+  member: string;
+  /** Hard expiry (epoch ms) — protected work must stop at/after this. */
+  deadline: number;
+}
+
 export interface Coordinator {
   kind: "memory" | "redis";
-  acquireSlot(owner: string): Promise<boolean>;
-  releaseSlot(owner: string): Promise<void>;
+  /** Atomically acquire a lease, or null at capacity. `ttlMs` bounds the
+   *  lease lifetime; expiry auto-releases so crashed holders can't leak. */
+  acquireSlot(owner: string, ttlMs: number): Promise<SlotLease | null>;
+  /** Conditional release — only removes THIS lease's member. */
+  releaseSlot(owner: string, lease: SlotLease): Promise<void>;
+  /** True while this exact lease is still live (not expired/evicted). */
+  leaseValid(owner: string, lease: SlotLease): Promise<boolean>;
   reserveIdem(opts: {
     scopeKey: string;
     fingerprint: string;
@@ -46,6 +60,8 @@ export interface Coordinator {
   }): Promise<IdemReserveResult>;
   finalizeIdem(scopeKey: string): Promise<void>;
   abandonIdem(scopeKey: string): Promise<void>;
+  /** Atomic shared rate-limit decision: returns true if allowed. */
+  rateLimit(scope: string, key: string, windowMs: number, max: number): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -55,13 +71,40 @@ export interface Coordinator {
 // --------------------------------------------------------------------------
 
 export function memoryCoordinator(): Coordinator {
+  // Lease-aware Map mirroring the Redis ZSET semantics: members are
+  // unique lease ids with expiry scores; capacity check is atomic because
+  // the impl is synchronous within a single process.
+  const leases = new Map<string, Map<string, number>>();
+  const prune = (owner: string, now: number) => {
+    const l = leases.get(owner);
+    if (!l) return;
+    for (const [m, exp] of l) if (exp <= now) l.delete(m);
+    if (l.size === 0) leases.delete(owner);
+  };
   return {
     kind: "memory",
-    async acquireSlot(owner) {
-      return acquireOwnerSlot(owner);
+    async acquireSlot(owner, ttlMs) {
+      const now = Date.now();
+      prune(owner, now);
+      const l = leases.get(owner) ?? new Map<string, number>();
+      if (l.size >= 3) return null; // MAX_CONCURRENT_PER_OWNER
+      const lease: SlotLease = {
+        id: `lease-${Math.random().toString(36).slice(2, 12)}`,
+        member: "",
+        deadline: now + ttlMs,
+      };
+      lease.member = `${lease.id}:${lease.deadline}`;
+      l.set(lease.member, lease.deadline);
+      leases.set(owner, l);
+      return lease;
     },
-    async releaseSlot(owner) {
-      releaseOwnerSlot(owner);
+    async releaseSlot(owner, lease) {
+      leases.get(owner)?.delete(lease.member);
+    },
+    async leaseValid(owner, lease) {
+      const now = Date.now();
+      prune(owner, now);
+      return leases.get(owner)?.has(lease.member) ?? false;
     },
     async reserveIdem({ scopeKey, fingerprint, sessionId }) {
       const r = reserveIdempotency(scopeKey, fingerprint, sessionId);
@@ -76,6 +119,11 @@ export function memoryCoordinator(): Coordinator {
     },
     async abandonIdem(scopeKey) {
       abandonIdempotency(scopeKey);
+    },
+    async rateLimit() {
+      // Memory impl does not own rate limiting — the existing per-process
+      // middleware remains the tested path for single-instance mode.
+      return true;
     },
     async close() {},
   };
@@ -109,21 +157,42 @@ return redis.call("SET", KEYS[1], cjson.encode(v), "XX")`;
 export function redisCoordinator(client: Redis): Coordinator {
   const slotKey = (o: string) => `ps:slots:${o}`;
 
+  // Atomic semaphore: prune expired leases + capacity check + insert, all in
+  // one Lua call — no oversubscription window. Members are `leaseId:deadline`
+  // so releases and validity checks are exact-match (a stale worker cannot
+  // release a newer worker's lease).
+  const ACQUIRE_LUA = `
+redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", ARGV[1])
+if redis.call("ZCARD", KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+redis.call("ZADD", KEYS[1], ARGV[3], ARGV[4])
+redis.call("PEXPIRE", KEYS[1], ARGV[5])
+return 1`;
+
   return {
     kind: "redis",
-    async acquireSlot(owner) {
-      const n = await client.incr(slotKey(owner));
-      if (n === 1) await client.pexpire(slotKey(owner), 300_000); // bounded leak on crash
-      if (n > 3) { // MAX_CONCURRENT_PER_OWNER
-        await client.decr(slotKey(owner));
-        return false;
-      }
-      return true;
+    async acquireSlot(owner, ttlMs) {
+      const now = Date.now();
+      const lease: SlotLease = {
+        id: randomUUID(),
+        member: "",
+        deadline: now + ttlMs,
+      };
+      lease.member = `${lease.id}:${lease.deadline}`;
+      const ok = await client.eval(
+        ACQUIRE_LUA, 1, slotKey(owner),
+        String(now), "3", String(lease.deadline), lease.member, String(ttlMs * 2),
+      );
+      return ok === 1 ? lease : null;
     },
-    async releaseSlot(owner) {
+    async releaseSlot(owner, lease) {
+      // Exact-member remove — no-op if the lease already expired or was never
+      // ours. A stale worker's release can never delete a newer lease.
+      await client.zrem(slotKey(owner), lease.member);
+    },
+    async leaseValid(owner, lease) {
       const k = slotKey(owner);
-      const n = await client.decr(k);
-      if (n <= 0) await client.del(k);
+      await client.zremrangebyscore(k, "-inf", Date.now());
+      return (await client.zscore(k, lease.member)) !== null;
     },
     async reserveIdem({ scopeKey, fingerprint, sessionId, ttlMs }) {
       const rk = scopeKey;
@@ -158,6 +227,17 @@ export function redisCoordinator(client: Redis): Coordinator {
       } catch {
         await client.del(scopeKey);
       }
+    },
+    async rateLimit(scope, key, windowMs, max) {
+      // Fixed-window atomic counter — shared across instances.
+      const k = `ps:rl:${scope}:${key}`;
+      const n = await client.eval(
+        `local c = redis.call("INCR", KEYS[1])
+         if c == 1 then redis.call("PEXPIRE", KEYS[1], ARGV[1]) end
+         return c`,
+        1, k, String(windowMs),
+      );
+      return (n as number) <= max;
     },
     async close() {
       await client.quit();

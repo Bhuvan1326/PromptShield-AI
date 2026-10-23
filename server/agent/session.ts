@@ -9,6 +9,7 @@ import type {
   TestCase,
 } from "../../shared/types";
 import { getTestCase } from "../engine/fixtures";
+import type { Coordinator } from "../coordination";
 import { executeTest } from "../engine/harness";
 import { registerSession, closeSession } from "../firewall/policy";
 
@@ -180,10 +181,7 @@ export async function runAgent(opts: {
   onStep?: (s: AgentSession) => void;
   /** Optional shared coordinator (Redis for multi-instance). Defaults to the
    *  process-local owner-slot map — identical to prior behavior. */
-  coordinator?: {
-    acquireSlot(owner: string): Promise<boolean>;
-    releaseSlot(owner: string): Promise<void>;
-  };
+  coordinator?: Coordinator;
 }): Promise<AgentRunResult> {
   const budget = PRESETS[opts.preset];
   const startedAt = Date.now();
@@ -216,13 +214,15 @@ export async function runAgent(opts: {
 
   // OWNER-SLOT LIFECYCLE: runAgent is the sole owner — acquire here, release
   // exactly once in finally below. A failed acquire NEVER releases (it owns
-  // nothing) and NEVER registers a firewall session. When a shared
-  // coordinator is injected (multi-instance), its acquire is awaited — the
-  // lifecycle contract is unchanged.
+  // nothing) and NEVER registers a firewall session.
+  // With a coordinator the slot is a LEASE: unique member + hard deadline
+  // (budget.maxMs + grace). If the lease is lost mid-run the worker must
+  // stop — an expired lease carries no authority for protected side effects.
   const coord = opts.coordinator;
-  const acquired = coord
-    ? await coord.acquireSlot(opts.owner)
-    : acquireOwnerSlot(opts.owner);
+  const lease = coord
+    ? await coord.acquireSlot(opts.owner, budget.maxMs + 30_000)
+    : null;
+  const acquired = coord ? lease !== null : acquireOwnerSlot(opts.owner);
   if (!acquired) {
     session.status = "error";
     session.phase = "done";
@@ -252,6 +252,14 @@ export async function runAgent(opts: {
       }
       if (session.consecutiveBlocks >= budget.maxConsecutiveBlocks) {
         session.stopReason = "defense_proven_for_budget";
+        break;
+      }
+      // Lease check (coordinator path): if this holder's lease expired — e.g.
+      // the worker stalled past its TTL — protected work must stop. The
+      // budget-time guard normally fires first (lease TTL > maxMs + grace),
+      // so this only triggers on genuine stall/ownership loss.
+      if (coord && lease && !(await coord.leaseValid(opts.owner, lease))) {
+        session.stopReason = "lease_lost";
         break;
       }
 
@@ -344,8 +352,8 @@ export async function runAgent(opts: {
     session.currentStrategy = null;
     cancelFlags.delete(session.id);
     closeSession(session.id);
-    if (coord) await coord.releaseSlot(opts.owner);
-    else releaseOwnerSlot(opts.owner);
+    if (coord && lease) await coord.releaseSlot(opts.owner, lease).catch(() => {});
+    else if (!coord) releaseOwnerSlot(opts.owner);
     step(session, {
       phase: "done",
       detail: `Session ${session.status}: ${session.stopReason} — ${session.budget.stepsUsed} step(s), ${session.successfulTestIds.length} verified success(es), ${session.blockedCount} blocked`,

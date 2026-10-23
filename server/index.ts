@@ -16,6 +16,7 @@ import { geminiStatus, GeminiUnavailable, investigate } from "./gemini";
 import { requireApiToken, safeTokenEqual } from "./auth";
 import { memoryCoordinator, redisCoordinator, type Coordinator } from "./coordination";
 import {
+  canAccess,
   clearSessionCookie,
   createSession,
   destroySession,
@@ -80,6 +81,11 @@ app.use((_req, res, next) => {
   next();
 });
 
+
+// Shared coordinator assigned at startup before listen(); rateLimit resolves
+// it lazily per request (assigned once — ref avoids a reassigned `let`).
+const coordinatorRef: { current: Coordinator | null } = { current: null };
+
 function rateLimit(opts: { windowMs: number; max: number; scope: string }) {
   const hits = new Map<string, { count: number; resetAt: number }>();
   const sweeper = setInterval(() => {
@@ -87,8 +93,21 @@ function rateLimit(opts: { windowMs: number; max: number; scope: string }) {
     for (const [k, v] of hits) if (v.resetAt <= now) hits.delete(k);
   }, 60_000);
   sweeper.unref();
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const key = `${opts.scope}:${req.ip ?? "unknown"}`;
+    if (coordinatorRef.current?.kind === "redis") {
+      try {
+        const ok = await coordinatorRef.current.rateLimit(opts.scope, key, opts.windowMs, opts.max);
+        res.setHeader("X-RateLimit-Limit", String(opts.max));
+        if (!ok) {
+          res.setHeader("Retry-After", String(Math.ceil(opts.windowMs / 1000)));
+          return res.status(429).json({ error: "Rate limit exceeded. Try again later." });
+        }
+        return next();
+      } catch {
+        return res.status(503).json({ error: "Rate limiting unavailable." });
+      }
+    }
     const now = Date.now();
     let entry = hits.get(key);
     if (!entry || entry.resetAt <= now) {
@@ -154,7 +173,8 @@ async function createCoordinator(): Promise<Coordinator> {
   }
   return memoryCoordinator();
 }
-const coordinator = await createCoordinator();
+coordinatorRef.current = await createCoordinator();
+const coordinator = coordinatorRef.current;
 
 // --- Operator sessions (cookie auth for the SPA; header-token remains for
 // API clients) -----------------------------------------------------------
@@ -219,7 +239,7 @@ function resolveSuiteTests(suiteId: string): string[] | null {
 }
 
 /** Execute a suite or single test, persist the run + findings + audit events. */
-function runHarness(environment: Environment, testIds: string[], suiteLabel: string): RunRecord {
+function runHarness(environment: Environment, testIds: string[], suiteLabel: string, owner?: string): RunRecord {
   return store.batch(() => {
     const startedAt = new Date();
     store.audit({
@@ -255,6 +275,7 @@ function runHarness(environment: Environment, testIds: string[], suiteLabel: str
     metrics: computeMetrics(scored.results, {
       unknownTestIds: scored.unknownTestIds.length,
     }),
+    owner,
   };
   const findings = findingsFromRun(run, results);
   store.addRun(run);
@@ -339,15 +360,19 @@ app.post("/api/runs", runsLimit, requireApiToken, (req, res) => {
   // semantics — duplicates are real data, not deduped).
   const expanded = repeat > 1 ? Array.from({ length: repeat }, () => testIds).flat() : testIds;
   try {
-    res.json(runHarness(environment, expanded, suiteLabel));
+    res.json(runHarness(environment, expanded, suiteLabel, ownerOf(req)));
   } catch {
     res.status(500).json({ error: "Harness execution failed" });
   }
 });
 
-app.get("/api/runs", (_req, res) => {
+app.get("/api/runs", (req, res) => {
+  // Deployed mode: callers see only their own runs (admin sees all).
+  const all = process.env.PS_API_TOKEN
+    ? store.listRuns().filter((r) => canAccess(req, r.owner))
+    : store.listRuns();
   res.json(
-    store.listRuns().map((r) => ({
+    all.map((r) => ({
       id: r.id,
       environment: r.environment,
       suite: r.suite,
@@ -362,13 +387,13 @@ app.get("/api/runs", (_req, res) => {
 
 app.get("/api/runs/:id", (req, res) => {
   const run = store.getRun(req.params.id);
-  if (!run) return res.status(404).json({ error: "Run not found" });
+  if (!run || !canAccess(req, run.owner)) return res.status(404).json({ error: "Run not found" });
   res.json(run);
 });
 
 app.get("/api/runs/:id/report", (req, res) => {
   const run = store.getRun(req.params.id);
-  if (!run) return res.status(404).json({ error: "Run not found" });
+  if (!run || !canAccess(req, run.owner)) return res.status(404).json({ error: "Run not found" });
   const report = buildReport(run, store.listFindings());
   store.audit({
     type: "report_exported",
@@ -407,7 +432,9 @@ app.patch("/api/findings/:id", requireApiToken, (req, res) => {
 app.post("/api/findings/:id/rerun", runsLimit, requireApiToken, (req, res) => {
   const finding = store.getFinding(req.params.id);
   if (!finding) return res.status(404).json({ error: "Finding not found" });
-  const run = runHarness(finding.environment, [finding.testId], "rerun");
+  const parentRun = store.getRun(finding.runId);
+  if (!canAccess(req, parentRun?.owner)) return res.status(403).json({ error: "Forbidden" });
+  const run = runHarness(finding.environment, [finding.testId], "rerun", ownerOf(req));
   const result = run.results[0];
   if (result.verdict === "pass") {
     store.updateFinding(finding.id, { status: "resolved" });
@@ -464,7 +491,7 @@ app.post("/api/investigate", investigateLimit, requireApiToken, async (req, res)
 
 app.post("/api/runs/:id/analysis", investigateLimit, requireApiToken, async (req, res) => {
   const run = store.getRun(req.params.id);
-  if (!run) return res.status(404).json({ error: "Run not found" });
+  if (!run || !canAccess(req, run.owner)) return res.status(404).json({ error: "Run not found" });
   const findings = store.listFindings().filter((f) => f.runId === run.id);
 
   store.audit({
@@ -596,6 +623,7 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
     stopReason: null,
     createdAt: new Date().toISOString(),
     seed: sessionId,
+    owner,
   };
   // Persist BEFORE launching so the first onStep update has a row to hit.
   try {
@@ -690,19 +718,23 @@ app.post("/api/agent/sessions", agentLimit, requireApiToken, async (req, res) =>
   res.status(202).json(store.getAgentSession(sessionId));
 });
 
-app.get("/api/agent/sessions", (_req, res) => {
-  res.json(store.listAgentSessions());
+app.get("/api/agent/sessions", (req, res) => {
+  // Deployed mode: callers see only their own sessions (admin sees all).
+  const sessions = process.env.PS_API_TOKEN
+    ? store.listAgentSessions().filter((s) => canAccess(req, s.owner))
+    : store.listAgentSessions();
+  res.json(sessions);
 });
 
 app.get("/api/agent/sessions/:id", (req, res) => {
   const s = store.getAgentSession(req.params.id);
-  if (!s) return res.status(404).json({ error: "Session not found" });
+  if (!s || !canAccess(req, s.owner)) return res.status(404).json({ error: "Session not found" });
   res.json(s);
 });
 
 app.post("/api/agent/sessions/:id/cancel", requireApiToken, (req, res) => {
   const s = store.getAgentSession(req.params.id);
-  if (!s) return res.status(404).json({ error: "Session not found" });
+  if (!s || !canAccess(req, s.owner)) return res.status(404).json({ error: "Session not found" });
   if (s.status !== "running") {
     return res.status(409).json({ error: `Session is ${s.status}, not running` });
   }
@@ -719,7 +751,7 @@ app.post("/api/agent/sessions/:id/cancel", requireApiToken, (req, res) => {
 
 app.get("/api/runs/:id/graph", (req, res) => {
   const run = store.getRun(req.params.id);
-  if (!run) return res.status(404).json({ error: "Run not found" });
+  if (!run || !canAccess(req, run.owner)) return res.status(404).json({ error: "Run not found" });
   const testMap = new Map(TEST_CASES.map((t) => [t.id, t]));
   res.json(buildAttackGraph(run, testMap, store.listFindings()));
 });
@@ -731,7 +763,9 @@ app.get("/api/defense-lab/compare", (req, res) => {
   if (!q.success) return res.status(400).json({ error: "Both runs 'a' and 'b' are required" });
   const a = store.getRun(q.data.a);
   const b = store.getRun(q.data.b);
-  if (!a || !b) return res.status(404).json({ error: "Both runs 'a' and 'b' are required" });
+  if (!a || !b || !canAccess(req, a.owner) || !canAccess(req, b.owner)) {
+    return res.status(404).json({ error: "Both runs 'a' and 'b' are required" });
+  }
   const testMap = new Map(TEST_CASES.map((t) => [t.id, t]));
   const resB = new Map(b.results.map((r) => [r.testId, r]));
 
@@ -769,6 +803,7 @@ app.get("/api/findings/:id/forensics", (req, res) => {
   const finding = store.getFinding(req.params.id);
   if (!finding) return res.status(404).json({ error: "Finding not found" });
   const run = store.getRun(finding.runId);
+  if (!canAccess(req, run?.owner)) return res.status(404).json({ error: "Finding not found" });
   const test = getTestCase(finding.testId);
   if (!run || !test) return res.status(404).json({ error: "Associated run/test not found" });
   res.json(buildForensicRecord(finding, run, test));
@@ -884,7 +919,7 @@ app.post("/api/benchmarks/run", runsLimit, requireApiToken, (req, res) => {
   const ids = resolveSuiteTests(suiteId);
   if (!ids) return res.status(404).json({ error: `Unknown suite '${suiteId}'` });
 
-  const run = runHarness(environment, ids, `benchmark:${suiteId}`);
+  const run = runHarness(environment, ids, `benchmark:${suiteId}`, ownerOf(req));
   const bench = toBenchmarkRun(
     { id: run.id, suite: suiteId, environment, metrics: run.metrics, results: run.results },
     weights as Partial<BenchmarkWeights>,
@@ -927,7 +962,7 @@ app.get("/api/benchmarks/compare", (req, res) => {
 
 app.get("/api/runs/:id/report.html", (req, res) => {
   const run = store.getRun(req.params.id);
-  if (!run) return res.status(404).json({ error: "Run not found" });
+  if (!run || !canAccess(req, run.owner)) return res.status(404).json({ error: "Run not found" });
   const report = buildReport(run, store.listFindings());
   const esc = (s: unknown) =>
     String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);

@@ -83,6 +83,8 @@ export interface RunRecord {
   metrics: RunMetrics;
   /** Set when this run was produced by an agent session — explicit link. */
   agentSessionId?: string;
+  /** Authenticated principal that created the run (deployed mode). */
+  owner?: string;
 }
 
 export interface ConfusionMatrix {
@@ -223,6 +225,8 @@ export interface AgentSession {
   seed: string;
   /** Set when the session's aggregate run has been persisted. */
   runId?: string;
+  /** Authenticated principal that created the session (deployed mode). */
+  owner?: string;
 }
 
 // --- Attack graph ----------------------------------------------------------
@@ -351,7 +355,9 @@ export interface AuditEvent {
   detail: string;
   /** Tamper-evidence hash chaining this event to the previous one. */
   hash?: string;
-  /** HMAC-SHA256 signature over `hash` (present when PS_AUDIT_SIGNING_KEY set). */
+  /** Monotonic sequence number — rollback/truncation detection. */
+  seq?: number;
+  /** Versioned HMAC signature `v1:<kid>:<hex>` (present when signing configured). */
   sig?: string;
 }
 

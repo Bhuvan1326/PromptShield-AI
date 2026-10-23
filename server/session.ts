@@ -107,6 +107,21 @@ export function ownerOf(req: express.Request): string {
   return `ip:${req.ip ?? "unknown"}`;
 }
 
+/**
+ * Object-level authorization: is this request allowed to touch a resource
+ * owned by `resourceOwner`?
+ *   local mode  → everything is allowed (single trusted user).
+ *   deployed    → the authenticated principal must equal the recorded owner,
+ *                 or hold an admin session. Resources with no recorded owner
+ *                 (legacy data) are admin-only — never silently public.
+ */
+export function canAccess(req: express.Request, resourceOwner: string | undefined | null): boolean {
+  if (!process.env.PS_API_TOKEN) return true; // local mode
+  if (sessionRole(req) === "admin") return true;
+  if (!resourceOwner) return false;
+  return ownerOf(req) === resourceOwner;
+}
+
 function safeTokenEqualStr(supplied: string): boolean {
   const expected = process.env.PS_API_TOKEN;
   if (!expected) return false;
