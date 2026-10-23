@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { Play } from "lucide-react";
 import {
   Bar,
   BarChart,
   CartesianGrid,
+  Legend,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -14,182 +16,194 @@ import { api } from "../lib/api";
 import { pct, fmtMs, fmtTime } from "../lib/format";
 import type { AppContext } from "../App";
 import {
+  Button,
   Card,
   EmptyState,
   EnvBadge,
+  MetricBlock,
   SectionTitle,
   SeverityBadge,
   Spinner,
-  StatCard,
+  StatusBadge,
+  Tag,
 } from "../components/ui";
+
+const CATEGORY_LABEL: Record<string, string> = {
+  benign: "Benign",
+  prompt_injection: "Prompt injection",
+  indirect_injection: "Indirect injection",
+  data_extraction: "Data extraction",
+  unauthorized_action: "Unauthorized action",
+  robustness: "Robustness",
+};
 
 export default function Overview({ ctx }: { ctx: AppContext }) {
   const [stats, setStats] = useState<OverviewStats | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(false);
 
   useEffect(() => {
     api.overview().then(setStats).catch((e) => setError(e.message));
   }, [ctx.refreshSignal]);
+
+  async function runFullSuite() {
+    setBootstrapping(true);
+    try {
+      await api.runSuite(ctx.environment, "full");
+      ctx.triggerRefresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Run failed");
+    } finally {
+      setBootstrapping(false);
+    }
+  }
 
   if (error)
     return <div className="text-xs text-danger">Failed to load overview: {error}</div>;
   if (!stats) return <Spinner label="Loading overview…" />;
 
   const empty = stats.totalRuns === 0;
-  const catLabel: Record<string, string> = {
-    benign: "Benign",
-    prompt_injection: "Prompt injection",
-    indirect_injection: "Indirect injection",
-    data_extraction: "Data extraction",
-    unauthorized_action: "Unauthorized action",
-    robustness: "Robustness",
-  };
+  const hasEnvData = stats.byEnvironment.baseline !== null || stats.byEnvironment.defended !== null;
+
+  const envChartData = (["baseline", "defended"] as const)
+    .filter((env) => stats.byEnvironment[env] !== null)
+    .map((env) => {
+      const m = stats.byEnvironment[env]!;
+      return {
+        name: env,
+        "Attack success": m.attackSuccessRate === null ? 0 : Math.round(m.attackSuccessRate * 100),
+        "Block rate": m.defenseBlockRate === null ? 0 : Math.round(m.defenseBlockRate * 100),
+        "False refusals": m.benignFalseRefusalRate === null ? 0 : Math.round(m.benignFalseRefusalRate * 100),
+      };
+    });
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-lg font-bold">Security Posture Overview</h1>
-        <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
-          Deterministic simulation harness comparing an intentionally vulnerable baseline
-          assistant against a guarded configuration — synthetic data only. Metrics below
-          are computed from actual executed tests, never from canned numbers.
-        </p>
+    <div className="space-y-4">
+      <header className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-base font-semibold">Security posture</h1>
+          <p className="mt-0.5 max-w-xl text-xs leading-relaxed text-muted">
+            Aggregated from actual test executions in this workspace.{" "}
+            <Tag>simulated harness metrics</Tag>
+          </p>
+        </div>
+        <Button onClick={runFullSuite} disabled={bootstrapping}>
+          {bootstrapping ? <Spinner /> : <><Play size={11} /> Run full suite on {ctx.environment}</>}
+        </Button>
       </header>
 
       {empty ? (
         <EmptyState
-          title="No test runs yet"
-          hint="Head to the Test Lab and run the full suite against both environments to populate this dashboard."
+          title="No test executions yet"
+          hint="Run the curated suite to populate attack success, block rate, false-refusal and latency metrics — all computed from real runs."
+          action={
+            <Button onClick={runFullSuite} disabled={bootstrapping}>
+              {bootstrapping ? <Spinner /> : <><Play size={11} /> Run Test Suite</>}
+            </Button>
+          }
         />
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-            <StatCard label="Total runs" value={String(stats.totalRuns)} hint={`${stats.totalTests} test executions`} />
-            <StatCard
-              label="Attack success rate"
-              value={pct(stats.attackSuccessRate)}
-              hint={`${stats.confirmedAttackSuccesses} confirmed attack success(es)`}
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+            <MetricBlock
+              label="Tests executed"
+              value={String(stats.totalTests)}
+              hint={`${stats.totalRuns} run(s) · ${stats.inconclusive} inconclusive · ${stats.errors} errors`}
+            />
+            <MetricBlock
+              label="Confirmed attack successes"
+              value={String(stats.confirmedAttackSuccesses)}
+              hint={`attack success rate ${pct(stats.attackSuccessRate)} of scored attacks`}
               tone="danger"
             />
-            <StatCard
+            <MetricBlock
               label="Defense block rate"
               value={pct(stats.defenseBlockRate)}
               hint="attacks neutralized ÷ scored attacks"
               tone="success"
             />
-            <StatCard
+            <MetricBlock
               label="Benign false refusals"
               value={pct(stats.benignFalseRefusalRate)}
-              hint="harmless requests wrongly blocked"
+              hint="harmless requests blocked ÷ scored benign"
               tone="warning"
             />
-            <StatCard label="Median latency" value={fmtMs(stats.medianLatencyMs)} />
-            <StatCard
-              label="Open findings"
-              value={String(stats.openFindings)}
-              hint={`${stats.inconclusive} inconclusive · ${stats.errors} errors`}
-            />
+            <MetricBlock label="Median latency" value={fmtMs(stats.medianLatencyMs)} hint="per test execution" />
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
+          <div className="grid gap-4 xl:grid-cols-2">
             <Card>
               <SectionTitle
-                title="Environment comparison"
-                subtitle="Same suite, different guardrails — aggregated across all runs"
+                title="Baseline vs defended"
+                subtitle="Aggregate rates per environment · percent of scored cases"
               />
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted">
-                    <th className="pb-2">Environment</th>
-                    <th className="pb-2">Attack success</th>
-                    <th className="pb-2">Block rate</th>
-                    <th className="pb-2">False refusals</th>
-                    <th className="pb-2">F1</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(["baseline", "defended"] as const).map((env) => {
-                    const m = stats.byEnvironment[env];
-                    return (
-                      <tr key={env} className="border-b border-border/50 last:border-0">
-                        <td className="py-2.5">
-                          <EnvBadge environment={env} />
-                        </td>
-                        <td className="py-2.5 tabular-nums text-danger">{m ? pct(m.attackSuccessRate) : "—"}</td>
-                        <td className="py-2.5 tabular-nums text-success">{m ? pct(m.defenseBlockRate) : "—"}</td>
-                        <td className="py-2.5 tabular-nums text-warning">{m ? pct(m.benignFalseRefusalRate) : "—"}</td>
-                        <td className="py-2.5 tabular-nums">{m?.f1 !== null && m ? m.f1.toFixed(2) : "—"}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              <p className="mt-3 text-[10px] leading-snug text-muted">
-                The baseline is intentionally vulnerable so the contrast is demonstrable.
-                Neither simulator is a real LLM.
-              </p>
-            </Card>
-
-            <Card>
-              <SectionTitle
-                title="Failures by category"
-                subtitle="Failed executions ÷ total executions per category, all runs"
-              />
-              {stats.categoryBreakdown.length === 0 ? (
-                <EmptyState title="No executions yet" />
+              {!hasEnvData ? (
+                <div className="p-4">
+                  <EmptyState title="No executions yet" />
+                </div>
               ) : (
-                <ResponsiveContainer width="100%" height={200}>
-                  <BarChart
-                    data={stats.categoryBreakdown.map((c) => ({
-                      name: catLabel[c.category] ?? c.category,
-                      failed: c.failed,
-                      passed: c.total - c.failed,
-                    }))}
-                    layout="vertical"
-                    margin={{ left: 40, right: 12 }}
-                  >
-                    <CartesianGrid stroke="#263650" strokeDasharray="3 3" horizontal={false} />
-                    <XAxis type="number" allowDecimals={false} stroke="#91A4C3" fontSize={10} />
-                    <YAxis type="category" dataKey="name" width={110} stroke="#91A4C3" fontSize={10} />
-                    <Tooltip
-                      contentStyle={{ background: "#162238", border: "1px solid #263650", fontSize: 11 }}
-                      cursor={{ fill: "rgba(34,211,238,0.05)" }}
-                    />
-                    <Bar dataKey="failed" stackId="a" fill="#FB7185" name="Failed" />
-                    <Bar dataKey="passed" stackId="a" fill="#34D399" name="Passed/inconclusive" radius={[0, 3, 3, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
+                <div className="p-3">
+                  <ResponsiveContainer width="100%" height={190}>
+                    <BarChart data={envChartData} margin={{ left: -20, right: 8, top: 4 }}>
+                      <CartesianGrid stroke="#2A384B" strokeDasharray="2 4" vertical={false} />
+                      <XAxis dataKey="name" stroke="#95A4B8" fontSize={11} tickLine={false} />
+                      <YAxis
+                        stroke="#95A4B8"
+                        fontSize={10}
+                        tickLine={false}
+                        axisLine={false}
+                        unit="%"
+                        domain={[0, 100]}
+                      />
+                      <Tooltip
+                        contentStyle={{
+                          background: "#182333",
+                          border: "1px solid #2A384B",
+                          borderRadius: 6,
+                          fontSize: 11,
+                        }}
+                        cursor={{ fill: "rgba(94,234,212,0.04)" }}
+                        formatter={(v) => [`${v}%`]}
+                      />
+                      <Legend wrapperStyle={{ fontSize: 10 }} iconSize={8} />
+                      <Bar dataKey="Attack success" fill="#FF7185" radius={[2, 2, 0, 0]} maxBarSize={26} />
+                      <Bar dataKey="Block rate" fill="#5EEAD4" radius={[2, 2, 0, 0]} maxBarSize={26} />
+                      <Bar dataKey="False refusals" fill="#F6C96B" radius={[2, 2, 0, 0]} maxBarSize={26} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                  <p className="px-1 pb-1 text-2xs leading-snug text-muted">
+                    Baseline is intentionally vulnerable so the contrast is demonstrable.
+                    Neither simulator is a real LLM.
+                  </p>
+                </div>
               )}
             </Card>
-          </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
             <Card>
-              <SectionTitle title="Recent runs" />
+              <SectionTitle title="Recent runs" subtitle="Newest first" />
               {stats.recentRuns.length === 0 ? (
-                <EmptyState title="No runs recorded" />
+                <div className="p-4"><EmptyState title="No runs recorded" /></div>
               ) : (
                 <table className="w-full text-xs">
                   <thead>
-                    <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted">
-                      <th className="pb-2">Run</th>
-                      <th className="pb-2">Env</th>
-                      <th className="pb-2">Suite</th>
-                      <th className="pb-2">Result</th>
+                    <tr className="border-b border-border text-left text-2xs uppercase tracking-wider text-muted">
+                      <th className="px-4 py-2 font-medium">Started</th>
+                      <th className="px-4 py-2 font-medium">Env</th>
+                      <th className="px-4 py-2 font-medium">Suite</th>
+                      <th className="px-4 py-2 font-medium text-right">Result</th>
                     </tr>
                   </thead>
                   <tbody>
                     {stats.recentRuns.map((r) => (
-                      <tr key={r.id} className="border-b border-border/50 last:border-0">
-                        <td className="py-2 font-mono text-[11px] text-muted">{fmtTime(r.at)}</td>
-                        <td className="py-2">
-                          <EnvBadge environment={r.environment} />
-                        </td>
-                        <td className="py-2 text-muted">{r.suite}</td>
-                        <td className="py-2 tabular-nums">
-                          <span className="text-success">{r.passed}✓</span>{" "}
-                          <span className="text-danger">{r.failed}✗</span>{" "}
-                          <span className="text-muted">/ {r.total}</span>
+                      <tr key={r.id} className="border-b border-border/50 last:border-0 hover:bg-card/40">
+                        <td className="px-4 py-2 font-mono text-2xs text-muted">{fmtTime(r.at)}</td>
+                        <td className="px-4 py-2"><EnvBadge environment={r.environment} /></td>
+                        <td className="px-4 py-2 font-mono text-2xs text-muted">{r.suite}</td>
+                        <td className="px-4 py-2 text-right font-mono text-2xs">
+                          <span className="text-success">{r.passed} pass</span>
+                          <span className="text-muted"> · </span>
+                          <span className="text-danger">{r.failed} fail</span>
+                          <span className="text-muted"> / {r.total}</span>
                         </td>
                       </tr>
                     ))}
@@ -197,39 +211,58 @@ export default function Overview({ ctx }: { ctx: AppContext }) {
                 </table>
               )}
             </Card>
-
-            <Card>
-              <SectionTitle
-                title="Top open findings"
-                subtitle="Newest unresolved findings across runs"
-                right={
-                  <Link to="/findings" className="text-xs text-accent hover:underline">
-                    View all →
-                  </Link>
-                }
-              />
-              {stats.topFindings.length === 0 ? (
-                <EmptyState title="No open findings" hint="Run the suite on the baseline to see vulnerabilities surface." />
-              ) : (
-                <ul className="space-y-2">
-                  {stats.topFindings.map((f) => (
-                    <li
-                      key={f.id}
-                      className="flex items-start justify-between gap-3 rounded-md border border-border bg-surface/60 px-3 py-2"
-                    >
-                      <div>
-                        <p className="text-xs font-medium">{f.title}</p>
-                        <p className="mt-0.5 font-mono text-[10px] text-muted">
-                          {f.testId} · <EnvBadge environment={f.environment} />
-                        </p>
-                      </div>
-                      <SeverityBadge severity={f.severity} />
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </Card>
           </div>
+
+          <Card>
+            <SectionTitle
+              title="Findings"
+              subtitle="Unresolved findings across all runs"
+              right={
+                <Link to="/findings" className="text-xs text-accent hover:underline">
+                  Open findings →
+                </Link>
+              }
+            />
+            {stats.topFindings.length === 0 ? (
+              <div className="p-4">
+                <EmptyState
+                  title="No open findings"
+                  hint="Run the suite on the baseline environment to surface vulnerabilities."
+                />
+              </div>
+            ) : (
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-border text-left text-2xs uppercase tracking-wider text-muted">
+                    <th className="px-4 py-2 font-medium">Severity</th>
+                    <th className="px-4 py-2 font-medium">Test</th>
+                    <th className="px-4 py-2 font-medium">Finding</th>
+                    <th className="px-4 py-2 font-medium">Category</th>
+                    <th className="px-4 py-2 font-medium">Mode</th>
+                    <th className="px-4 py-2 font-medium">Status</th>
+                    <th className="px-4 py-2 font-medium text-right">Created</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.topFindings.map((f) => (
+                    <tr key={f.id} className="border-b border-border/50 last:border-0 hover:bg-card/40">
+                      <td className="px-4 py-2"><SeverityBadge severity={f.severity} /></td>
+                      <td className="px-4 py-2 font-mono text-2xs text-muted">{f.testId}</td>
+                      <td className="px-4 py-2 text-foreground/90">{f.title}</td>
+                      <td className="px-4 py-2 text-2xs text-muted">
+                        {CATEGORY_LABEL[f.category] ?? f.category}
+                      </td>
+                      <td className="px-4 py-2"><EnvBadge environment={f.environment} /></td>
+                      <td className="px-4 py-2"><StatusBadge status={f.status} /></td>
+                      <td className="px-4 py-2 text-right font-mono text-2xs text-muted">
+                        {fmtTime(f.createdAt)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Card>
         </>
       )}
     </div>

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { NavLink, Route, Routes } from "react-router-dom";
+import { useEffect, useState, type Dispatch, type SetStateAction } from "react";
+import { NavLink, Route, Routes, useLocation } from "react-router-dom";
 import {
   ClipboardList,
   FlaskConical,
@@ -8,13 +8,13 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { api, type Catalog } from "./lib/api";
-import type { IntegrationStatus } from "@shared/types";
+import type { Environment, IntegrationStatus } from "@shared/types";
 import Overview from "./views/Overview";
 import TestLab from "./views/TestLab";
 import Findings from "./views/Findings";
 import Evaluation from "./views/Evaluation";
 import Audit from "./views/Audit";
-import { Spinner } from "./components/ui";
+import { EnvBadge, Spinner } from "./components/ui";
 
 const NAV = [
   { to: "/", label: "Overview", icon: Gauge, end: true },
@@ -27,15 +27,27 @@ const NAV = [
 export interface AppContext {
   catalog: Catalog;
   status: IntegrationStatus | null;
+  environment: Environment;
+  setEnvironment: Dispatch<SetStateAction<Environment>>;
   refreshSignal: number;
   triggerRefresh: () => void;
 }
 
+const PAGE_TITLES: Record<string, string> = {
+  "/": "Overview",
+  "/lab": "Test Lab",
+  "/findings": "Findings",
+  "/evaluation": "Evaluation",
+  "/audit": "Audit",
+};
+
 export default function App() {
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [status, setStatus] = useState<IntegrationStatus | null>(null);
+  const [environment, setEnvironment] = useState<Environment>("baseline");
   const [error, setError] = useState<string | null>(null);
   const [refreshSignal, setRefreshSignal] = useState(0);
+  const location = useLocation();
 
   useEffect(() => {
     Promise.all([api.catalog(), api.status()])
@@ -47,78 +59,124 @@ export default function App() {
   }, []);
 
   const ctx: AppContext | null = catalog
-    ? { catalog, status, refreshSignal, triggerRefresh: () => setRefreshSignal((n) => n + 1) }
+    ? {
+        catalog,
+        status,
+        environment,
+        setEnvironment,
+        refreshSignal,
+        triggerRefresh: () => setRefreshSignal((n) => n + 1),
+      }
     : null;
+
+  const apiUp = !error && catalog !== null;
 
   return (
     <div className="flex min-h-screen">
-      <aside className="fixed inset-y-0 left-0 z-30 flex w-56 flex-col border-r border-border bg-surface">
-        <div className="border-b border-border px-5 py-5">
+      {/* Left navigation — 220px engineering rail */}
+      <aside className="fixed inset-y-0 left-0 z-30 flex w-[220px] flex-col border-r border-border bg-surface">
+        <div className="border-b border-border px-4 py-4">
           <div className="flex items-center gap-2">
-            <ShieldCheck size={18} className="text-accent" />
-            <span className="text-sm font-bold tracking-wide">PromptShield AI</span>
+            <ShieldCheck size={15} className="text-accent" strokeWidth={2} />
+            <span className="text-[13px] font-semibold tracking-tight">PromptShield AI</span>
           </div>
-          <p className="mt-1 text-[10px] leading-snug text-muted">
-            Test the attack. Measure the defense.
-          </p>
+          <p className="mt-0.5 text-2xs text-muted">Security test workbench</p>
         </div>
-        <nav className="flex-1 space-y-0.5 px-2 py-3">
+        <nav className="flex-1 space-y-px px-2 py-3">
           {NAV.map(({ to, label, icon: Icon, end }) => (
             <NavLink
               key={to}
               to={to}
               end={end}
               className={({ isActive }) =>
-                `flex items-center gap-2.5 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+                `flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
                   isActive
-                    ? "bg-accent/10 text-accent"
-                    : "text-muted hover:bg-card hover:text-foreground"
+                    ? "bg-card text-foreground"
+                    : "text-muted hover:bg-card/60 hover:text-foreground"
                 }`
               }
             >
-              <Icon size={14} />
-              {label}
+              {({ isActive }) => (
+                <>
+                  <Icon size={14} strokeWidth={1.75} className={isActive ? "text-accent" : ""} />
+                  {label}
+                </>
+              )}
             </NavLink>
           ))}
         </nav>
         <div className="border-t border-border px-4 py-3">
-          <div className="flex items-center gap-2 text-[10px] text-muted">
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                status?.gemini.state === "configured" ? "bg-success" : "bg-warning"
-              }`}
-            />
-            {status?.gemini.state === "configured"
-              ? `Gemini connected · ${status.gemini.model}`
-              : "Deterministic mode · Gemini not configured"}
+          <div className="space-y-1.5 text-2xs text-muted">
+            <div className="flex items-center justify-between">
+              <span>API</span>
+              <span className="flex items-center gap-1.5">
+                <span className={`h-1.5 w-1.5 rounded-full ${apiUp ? "bg-success" : "bg-danger"}`} />
+                {apiUp ? "connected" : "offline"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Gemini</span>
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    status?.gemini.state === "configured" ? "bg-success" : "bg-muted/40"
+                  }`}
+                />
+                {status?.gemini.state === "configured" ? status.gemini.model : "not configured"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Engine</span>
+              <span>{status ? `${status.engine.testCases} fixtures` : "—"}</span>
+            </div>
           </div>
-          <p className="mt-2 text-[9px] leading-snug text-muted/60">
-            Simulation harness only — synthetic data, no real systems.
+          <p className="mt-3 border-t border-border/60 pt-2 text-2xs leading-snug text-muted/60">
+            Simulation harness · synthetic data only
           </p>
         </div>
       </aside>
 
-      <main className="ml-56 flex-1 px-8 py-6">
-        {error && (
-          <div className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-4 py-3 text-xs text-danger">
-            Could not reach the PromptShield API ({error}). Is the backend running on port 8787?
+      <div className="ml-[220px] flex min-h-screen flex-1 flex-col">
+        {/* Compact header */}
+        <header className="sticky top-0 z-20 flex h-11 items-center justify-between border-b border-border bg-background/95 px-5 backdrop-blur-sm">
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-muted">PromptShield</span>
+            <span className="text-muted/50">/</span>
+            <span className="font-medium text-foreground">
+              {PAGE_TITLES[location.pathname] ?? "Overview"}
+            </span>
           </div>
-        )}
-        {!ctx && !error && (
-          <div className="flex h-64 items-center justify-center">
-            <Spinner label="Loading test catalog…" />
+          <div className="flex items-center gap-3">
+            <span className="text-2xs text-muted">Environment</span>
+            <EnvBadge environment={environment} />
+            <span className="hidden text-2xs text-muted sm:inline">
+              simulated harness · no live targets
+            </span>
           </div>
-        )}
-        {ctx && (
-          <Routes>
-            <Route path="/" element={<Overview ctx={ctx} />} />
-            <Route path="/lab" element={<TestLab ctx={ctx} />} />
-            <Route path="/findings" element={<Findings ctx={ctx} />} />
-            <Route path="/evaluation" element={<Evaluation ctx={ctx} />} />
-            <Route path="/audit" element={<Audit ctx={ctx} />} />
-          </Routes>
-        )}
-      </main>
+        </header>
+
+        <main className="flex-1 px-5 py-5">
+          {error && (
+            <div className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-4 py-3 text-xs text-danger">
+              Could not reach the PromptShield API ({error}). Is the backend running on port 8787?
+            </div>
+          )}
+          {!ctx && !error && (
+            <div className="flex h-64 items-center justify-center">
+              <Spinner label="Loading test catalog…" />
+            </div>
+          )}
+          {ctx && (
+            <Routes>
+              <Route path="/" element={<Overview ctx={ctx} />} />
+              <Route path="/lab" element={<TestLab ctx={ctx} />} />
+              <Route path="/findings" element={<Findings ctx={ctx} />} />
+              <Route path="/evaluation" element={<Evaluation ctx={ctx} />} />
+              <Route path="/audit" element={<Audit ctx={ctx} />} />
+            </Routes>
+          )}
+        </main>
+      </div>
     </div>
   );
 }

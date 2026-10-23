@@ -21,8 +21,8 @@ const typeColors: Record<string, string> = {
   finding_created: "text-danger",
   report_exported: "text-indigo",
   data_reset: "text-warning",
-  investigation_requested: "text-violet",
-  investigation_completed: "text-violet",
+  investigation_requested: "text-indigo",
+  investigation_completed: "text-indigo",
   investigation_failed: "text-warning",
 };
 
@@ -57,18 +57,18 @@ export default function Audit({ ctx }: { ctx: AppContext }) {
   }
 
   return (
-    <div className="space-y-6">
-      <header className="flex items-start justify-between gap-4">
+    <div className="space-y-4">
+      <header className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-lg font-bold">Audit Trail</h1>
-          <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted">
-            Every harness action is recorded: runs, test executions, findings, exports,
-            investigations and resets. No raw prompt content or canary values are logged.
+          <h1 className="text-base font-semibold">Audit trail</h1>
+          <p className="mt-0.5 max-w-xl text-xs leading-relaxed text-muted">
+            Engineering event stream: runs, executions, findings, exports, investigations
+            and resets. No raw prompt content or canary values are logged.
           </p>
         </div>
         <Button variant="danger" onClick={reset} disabled={busy}>
-          <Trash2 size={12} />
-          {confirming ? "Click again to confirm reset" : "Reset all data"}
+          <Trash2 size={11} />
+          {confirming ? "Confirm reset" : "Reset all data"}
         </Button>
       </header>
 
@@ -79,30 +79,31 @@ export default function Audit({ ctx }: { ctx: AppContext }) {
       ) : events.length === 0 ? (
         <EmptyState title="Audit log is empty" hint="Harness actions will appear here." />
       ) : (
-        <Card className="p-0">
-          <div className="border-b border-border px-4 py-3">
-            <SectionTitle title={`${events.length} events`} subtitle="Newest first · capped at 500 entries" />
+        <Card className="overflow-hidden">
+          <SectionTitle
+            title={`${events.length} events`}
+            subtitle="Newest first · capped at 500 entries"
+          />
+          <div className="divide-y divide-border/40">
+            {events.map((e) => (
+              <div
+                key={e.id}
+                className="flex items-baseline gap-4 px-4 py-2 font-mono text-2xs hover:bg-card/40"
+              >
+                <span className="shrink-0 tabular-nums text-muted">{fmtTime(e.at)}</span>
+                <span className={`w-44 shrink-0 ${typeColors[e.type] ?? "text-muted"}`}>
+                  {e.type}
+                </span>
+                <span className="shrink-0">
+                  {e.environment ? <EnvBadge environment={e.environment} /> : <span className="text-muted/40">—</span>}
+                </span>
+                {e.testId && <span className="shrink-0 text-muted">{e.testId}</span>}
+                <span className="min-w-0 truncate font-sans text-xs text-foreground/80">
+                  {e.detail}
+                </span>
+              </div>
+            ))}
           </div>
-          <table className="w-full text-xs">
-            <tbody>
-              {events.map((e) => (
-                <tr key={e.id} className="border-b border-border/40 last:border-0 hover:bg-surface/40">
-                  <td className="whitespace-nowrap px-4 py-2.5 font-mono text-[10px] text-muted">
-                    {fmtTime(e.at)}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span className={`font-mono text-[10px] font-medium ${typeColors[e.type] ?? "text-muted"}`}>
-                      {e.type}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    {e.environment && <EnvBadge environment={e.environment} />}
-                  </td>
-                  <td className="px-4 py-2.5 text-[11px] text-foreground/85">{e.detail}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
         </Card>
       )}
     </div>

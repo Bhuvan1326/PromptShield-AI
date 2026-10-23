@@ -8,10 +8,16 @@
 
 body {
   @apply bg-background text-foreground font-sans antialiased;
+  font-feature-settings: "cv05", "ss01";
 }
 
 ::selection {
-  background: rgba(34, 211, 238, 0.25);
+  background: rgba(94, 234, 212, 0.22);
+}
+
+:focus-visible {
+  outline: 1px solid #5eead4;
+  outline-offset: 1px;
 }
 
 *::-webkit-scrollbar {
@@ -22,10 +28,10 @@ body {
   background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: #263650;
-  border-radius: 8px;
-  border: 2px solid #0b1020;
+  background: #2a384b;
+  border-radius: 6px;
+  border: 2px solid #0c111b;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: #35507a;
+  background: #3a4f6b;
 }
